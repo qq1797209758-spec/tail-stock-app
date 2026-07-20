@@ -3,7 +3,9 @@
 from datetime import datetime, time as clock_time
 from html import escape
 from pathlib import Path
+from threading import Lock
 import time
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -54,6 +56,7 @@ from config import (
     SCORING_CACHE_TTL,
     SCORING_MAX_RESULTS,
     SCORING_REQUEST_INTERVAL_SECONDS,
+    SCAN_HISTORY_DATABASE,
     SECTOR_CHANGE_SCORE_MAX,
     SECTOR_CHANGE_SCORE_MIN,
     TURNOVER_RATE_MAX,
@@ -73,6 +76,11 @@ from services.scoring_data import (
     fetch_stock_scoring_context,
     match_industry_change,
 )
+from services.scan_history import (
+    ScanRecord,
+    SQLiteScanHistoryRepository,
+    dataframe_records,
+)
 from strategy.filters import apply_filters
 from strategy.reporting import build_excluded_results, build_missing_records
 from strategy.scoring import calculate_candidate_score, select_top_candidates
@@ -80,6 +88,7 @@ from utils.logger import get_logger
 
 
 logger = get_logger(__name__)
+_SCAN_LOCK = Lock()
 
 
 def get_strategy_parameter_snapshot() -> dict[str, object]:
@@ -93,9 +102,16 @@ def get_strategy_parameter_snapshot() -> dict[str, object]:
         elif isinstance(value, (str, int, float, bool)):
             snapshot[name] = value
     return snapshot
+
+
 BASE_DIR = Path(__file__).resolve().parent
 CSS_FILE = BASE_DIR / "assets" / "styles.css"
 MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+@st.cache_resource(show_spinner=False)
+def get_scan_history_repository() -> SQLiteScanHistoryRepository:
+    return SQLiteScanHistoryRepository(BASE_DIR / SCAN_HISTORY_DATABASE)
 
 
 @st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
@@ -176,8 +192,9 @@ def render_strategy_sidebar() -> None:
         st.write(f"**量能放大：** 尾盘/14:30前30分钟均量 ≥ {LATE_VOLUME_EXPANSION_RATIO:g} 倍")
         st.divider()
         st.write("**综合评分：** 资金30 + 板块20 + 技术20 + 尾盘20 + 情绪10")
-        st.write(f"**入选门槛：** ≥ {SCORE_MINIMUM:g} 分")
-        st.write(f"**最多展示：** {SCORING_MAX_RESULTS} 只")
+        st.write(f"**评分达标线：** ≥ {SCORE_MINIMUM:g} 分")
+        st.write(f"**每日研究名单：** 目标 {SCORING_MAX_RESULTS} 只")
+        st.caption("不足10只达标股票时，按真实综合评分递补并明确标记未达标；不生成虚假股票。")
         st.caption("评分数据缺失时，对应分项计0分并在结果中说明。")
         with st.expander("查看评分计算依据"):
             st.write(
@@ -213,6 +230,7 @@ def apply_limit_up_filter(candidates):
         empty["最近涨停日期"] = pd.Series(dtype="string")
         empty["20日涨停次数"] = pd.Series(dtype="int64")
         empty["数据状态"] = pd.Series(dtype="string")
+        empty["历史错误原因"] = pd.Series(dtype="string")
         return empty, empty.copy()
 
     processed_rows = []
@@ -236,6 +254,7 @@ def apply_limit_up_filter(candidates):
                 "20日涨停次数": 0,
                 "数据状态": error.status,
                 "涨停判断": "数据不足",
+                "历史错误原因": str(error),
             }
         except Exception as error:
             logger.exception("股票 %s 历史判断发生未知错误", stock_code)
@@ -245,12 +264,13 @@ def apply_limit_up_filter(candidates):
                 "20日涨停次数": 0,
                 "数据状态": "无法验证",
                 "涨停判断": "数据不足",
+                "历史错误原因": f"未知错误（{type(error).__name__}）",
             }
 
         output_row = row.copy()
         for field in (
             "20日内是否涨停", "最近涨停日期", "20日涨停次数",
-            "数据状态", "涨停判断",
+            "数据状态", "涨停判断", "历史错误原因",
         ):
             output_row[field] = result[field]
         processed_rows.append(output_row)
@@ -393,6 +413,11 @@ def initialize_dashboard_state() -> None:
         "highest_score": None,
         "scan_payload": None,
         "dashboard_notice": None,
+        "current_view": "dashboard",
+        "scan_in_progress": False,
+        "active_scan_id": None,
+        "last_scan_duration": None,
+        "interface_health_status": "待检查",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -400,6 +425,12 @@ def initialize_dashboard_state() -> None:
 
 
 def queue_dashboard_action(action: str) -> None:
+    if st.session_state.get("scan_in_progress"):
+        st.session_state.dashboard_notice = (
+            "warning",
+            "完整扫描正在运行，请勿重复提交。如需终止，可停止 Streamlit 进程或关闭当前会话。",
+        )
+        return
     st.session_state.pending_action = action
 
 
@@ -441,31 +472,149 @@ def refresh_market_snapshot() -> None:
         st.session_state.highest_score = None
         st.session_state.scan_payload = None
         if market_data.attrs.get("is_fallback"):
+            st.session_state.interface_health_status = "部分降级"
             st.session_state.dashboard_notice = (
                 "warning",
                 "东方财富接口暂时不可用，已切换至 AKShare 新浪备用源。"
                 "备用源缺少量比、换手率和总市值，可查看行情，但不会将数据不足的股票判定为策略合格。",
             )
         else:
+            st.session_state.interface_health_status = "正常"
             st.session_state.dashboard_notice = ("success", "行情刷新成功，可以开始今日扫描。")
     except MarketDataError as error:
         logger.exception("刷新行情失败")
         st.session_state.data_source_status = "异常"
+        st.session_state.interface_health_status = "异常"
         st.session_state.dashboard_notice = ("error", f"行情刷新失败：{error}")
     except Exception as error:
         logger.exception("刷新行情发生未知错误")
         st.session_state.data_source_status = "异常"
+        st.session_state.interface_health_status = "异常"
         st.session_state.dashboard_notice = (
             "error",
             f"行情刷新失败（{type(error).__name__}），详细信息已记录。",
         )
 
 
+def _scan_interface_health(
+    data_source_status: str,
+    history_results: pd.DataFrame,
+    late_session_results: pd.DataFrame,
+    scoring_results: pd.DataFrame,
+) -> tuple[dict[str, object], list[str]]:
+    history_ok = int(history_results.get("数据状态", pd.Series(dtype="string")).eq("正常").sum())
+    history_failed = len(history_results) - history_ok
+    late_ok = int(late_session_results.get("尾盘结构状态", pd.Series(dtype="string")).ne("无法验证").sum())
+    late_failed = len(late_session_results) - late_ok
+    scoring_missing = int(
+        scoring_results.get("缺失项", pd.Series(dtype="string"))
+        .astype("string").str.strip().fillna("").ne("").sum()
+    )
+    health = {
+        "实时行情": data_source_status,
+        "历史行情": {"成功": history_ok, "失败或不足": history_failed},
+        "分钟行情": {"成功": late_ok, "无法验证": late_failed},
+        "评分附加数据": {"评分数量": len(scoring_results), "存在缺失": scoring_missing},
+    }
+    errors: list[str] = []
+    if history_failed:
+        errors.append(f"历史行情：{history_failed}只数据不足或无法验证")
+    if late_failed:
+        errors.append(f"分钟行情：{late_failed}只无法验证")
+    if scoring_missing:
+        errors.append(f"评分数据：{scoring_missing}只存在缺失项")
+    return health, errors
+
+
+def _save_scan_record(
+    *,
+    scan_id: str,
+    started_at: datetime,
+    completed_at: datetime,
+    status: str,
+    data_updated_at: datetime,
+    data_source_status: str,
+    initial_results: pd.DataFrame,
+    history_results: pd.DataFrame,
+    limit_up_results: pd.DataFrame,
+    late_session_results: pd.DataFrame,
+    late_qualified: pd.DataFrame,
+    scoring_results: pd.DataFrame,
+    final_results: pd.DataFrame,
+    interface_errors: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object], list[str]]:
+    excluded_results = build_excluded_results(
+        history_results, late_session_results, scoring_results, final_results
+    )
+    missing_records = build_missing_records(
+        history_results, late_session_results, scoring_results
+    )
+    health, detected_errors = _scan_interface_health(
+        data_source_status, history_results, late_session_results, scoring_results
+    )
+    all_errors = list(dict.fromkeys([*interface_errors, *detected_errors]))
+    duration = max(0.0, (completed_at - started_at).total_seconds())
+    record = ScanRecord(
+        scan_id=scan_id,
+        started_at=started_at.isoformat(),
+        completed_at=completed_at.isoformat(),
+        scan_date=started_at.date().isoformat(),
+        duration_seconds=round(duration, 3),
+        status=status,
+        data_updated_at=data_updated_at.isoformat(),
+        data_source_status=data_source_status,
+        strategy_parameters=get_strategy_parameter_snapshot(),
+        counts={
+            "initial": len(initial_results),
+            "history_success": int(history_results.get("数据状态", pd.Series(dtype="string")).eq("正常").sum()),
+            "limit_up": len(limit_up_results),
+            "late_qualified": len(late_qualified),
+            "scored": len(scoring_results),
+            "final": len(final_results),
+        },
+        interface_health=health,
+        interface_errors=all_errors,
+        initial_results=dataframe_records(initial_results),
+        final_top5=dataframe_records(final_results),
+        excluded_results=dataframe_records(excluded_results),
+        missing_records=dataframe_records(missing_records),
+    )
+    get_scan_history_repository().save_scan(record)
+    return excluded_results, missing_records, health, all_errors
+
+
 def run_today_scan() -> None:
+    if st.session_state.get("scan_in_progress") or not _SCAN_LOCK.acquire(blocking=False):
+        st.session_state.dashboard_notice = (
+            "warning", "已有一次完整扫描正在运行，本次重复请求已忽略。"
+        )
+        return
+
+    scan_id = uuid4().hex
+    started_at = datetime.now(MARKET_TIMEZONE)
+    updated_at = started_at
+    market_data = pd.DataFrame()
+    initial_results = pd.DataFrame()
+    history_results = pd.DataFrame()
+    limit_up_results = pd.DataFrame()
+    late_session_results = pd.DataFrame()
+    late_qualified = pd.DataFrame()
+    scoring_results = pd.DataFrame()
+    final_results = pd.DataFrame()
+    data_source_status = "异常"
+    interface_errors: list[str] = []
+    st.session_state.scan_in_progress = True
+    st.session_state.active_scan_id = scan_id
+    st.session_state.dashboard_notice = (
+        "info", f"扫描 {scan_id[:8]} 已开始。扫描运行期间请勿重复点击；如需强制终止，请停止 Streamlit 进程。"
+    )
     try:
         with st.spinner("正在获取行情并执行现有策略流程，请稍候……"):
             market_data, updated_at = load_market_data()
             filter_result = apply_filters(market_data)
+            initial_results = filter_result.final
+            source = market_data.attrs.get("data_source", "AKShare")
+            data_source_status = f"正常 · {source}"
         history_results, limit_up_results = apply_limit_up_filter(filter_result.final)
         late_session_results, late_qualified = apply_late_session_filter(
             limit_up_results
@@ -475,16 +624,46 @@ def run_today_scan() -> None:
         )
     except MarketDataError as error:
         logger.exception("AKShare 行情连接失败")
+        interface_errors.append(f"实时行情：{error}")
         st.session_state.data_source_status = "异常"
         st.session_state.dashboard_notice = ("error", f"扫描失败：{error}")
-        return
     except Exception as error:
         logger.exception("今日扫描失败")
+        interface_errors.append(f"扫描流程：{type(error).__name__}")
         st.session_state.data_source_status = "异常"
         st.session_state.dashboard_notice = (
             "error",
             f"扫描失败（{type(error).__name__}），详细信息已记录，页面仍可使用。",
         )
+    finally:
+        completed_at = datetime.now(MARKET_TIMEZONE)
+        status = "失败" if market_data.empty else ("部分完成" if interface_errors else "成功")
+        try:
+            excluded_results, missing_records, health, interface_errors = _save_scan_record(
+                scan_id=scan_id, started_at=started_at, completed_at=completed_at,
+                status=status, data_updated_at=updated_at,
+                data_source_status=data_source_status, initial_results=initial_results,
+                history_results=history_results, limit_up_results=limit_up_results,
+                late_session_results=late_session_results, late_qualified=late_qualified,
+                scoring_results=scoring_results, final_results=final_results,
+                interface_errors=interface_errors,
+            )
+            st.session_state.interface_health_status = "正常" if not interface_errors and missing_records.empty else "部分降级"
+        except Exception as storage_error:
+            logger.exception("扫描历史保存失败")
+            excluded_results = pd.DataFrame()
+            missing_records = pd.DataFrame()
+            health = {"历史存储": f"失败（{type(storage_error).__name__}）"}
+            st.session_state.interface_health_status = "异常"
+            interface_errors.append(f"历史存储：{type(storage_error).__name__}")
+
+        duration = max(0.0, (completed_at - started_at).total_seconds())
+        st.session_state.last_scan_duration = duration
+        st.session_state.scan_in_progress = False
+        st.session_state.active_scan_id = None
+        _SCAN_LOCK.release()
+
+    if market_data.empty:
         return
 
     highest_score = None
@@ -494,24 +673,28 @@ def run_today_scan() -> None:
             highest_score = float(score_values.max())
 
     st.session_state.last_data_update = updated_at
-    source = market_data.attrs.get("data_source", "AKShare")
-    st.session_state.data_source_status = f"正常 · {source}"
+    st.session_state.data_source_status = data_source_status
     st.session_state.market_stock_count = len(market_data)
-    st.session_state.first_round_count = len(filter_result.final)
+    st.session_state.first_round_count = len(initial_results)
     st.session_state.final_candidate_count = len(final_results)
     st.session_state.highest_score = highest_score
     st.session_state.scan_payload = {
-        "updated_at": updated_at,
-        "initial_filter_count": len(filter_result.final),
-        "initial_results": filter_result.final,
-        "history_results": history_results,
-        "limit_up_results": limit_up_results,
-        "late_session_results": late_session_results,
-        "late_qualified": late_qualified,
-        "scoring_results": scoring_results,
-        "final_results": final_results,
+        "scan_id": scan_id, "scan_duration": duration, "interface_health": health,
+        "interface_errors": interface_errors, "updated_at": updated_at,
+        "initial_filter_count": len(initial_results), "initial_results": initial_results,
+        "history_results": history_results, "limit_up_results": limit_up_results,
+        "late_session_results": late_session_results, "late_qualified": late_qualified,
+        "scoring_results": scoring_results, "final_results": final_results,
+        "excluded_results": excluded_results, "missing_records": missing_records,
     }
-    st.session_state.dashboard_notice = ("success", "今日扫描已完成。")
+    if interface_errors:
+        st.session_state.dashboard_notice = (
+            "warning", f"扫描 {scan_id[:8]} 已部分完成，耗时 {duration:.1f} 秒；请查看接口错误记录。"
+        )
+    else:
+        st.session_state.dashboard_notice = (
+            "success", f"扫描 {scan_id[:8]} 已完成，耗时 {duration:.1f} 秒。"
+        )
 
 
 def handle_pending_action() -> None:
@@ -522,10 +705,9 @@ def handle_pending_action() -> None:
     elif action == "refresh":
         refresh_market_snapshot()
     elif action == "history":
-        st.session_state.dashboard_notice = (
-            "info",
-            "历史记录将在 V2 后续阶段接入；当前版本不会生成虚假历史数据。",
-        )
+        st.session_state.current_view = "history"
+    elif action == "dashboard":
+        st.session_state.current_view = "dashboard"
 
 
 def render_status_and_metrics(now: datetime) -> None:
@@ -544,6 +726,9 @@ def render_status_and_metrics(now: datetime) -> None:
         ("A股市场状态", market_status, market_status_class),
         ("最近数据更新时间", updated_text, ""),
         ("数据源状态", source_status, source_class),
+        ("接口健康", str(st.session_state.interface_health_status),
+         "status-live" if st.session_state.interface_health_status == "正常" else "status-warn"),
+        ("最近扫描耗时", "--" if st.session_state.last_scan_duration is None else f"{st.session_state.last_scan_duration:.1f}秒", ""),
     ]
     status_html = "".join(
         f'<div class="status-card"><span class="status-label">{escape(label)}</span>'
@@ -591,6 +776,22 @@ def render_scan_results(payload: dict[str, object]) -> None:
     late_session_results = payload["late_session_results"]
     scoring_results = payload["scoring_results"]
     final_results = payload["final_results"]
+
+    scan_id = str(payload.get("scan_id", ""))
+    scan_duration = payload.get("scan_duration")
+    metadata = f"数据更新：{updated_at:%Y-%m-%d %H:%M:%S}"
+    if scan_id:
+        metadata += f" · scan_id: {scan_id}"
+    if scan_duration is not None:
+        metadata += f" · 耗时：{float(scan_duration):.1f}秒"
+    st.caption(metadata)
+    interface_health = payload.get("interface_health", {})
+    interface_errors = payload.get("interface_errors", [])
+    if interface_health:
+        with st.expander("查看接口健康状态"):
+            st.json(interface_health)
+            if interface_errors:
+                st.warning("；".join(str(item) for item in interface_errors))
 
     successful_history_count = int(history_results["数据状态"].eq("正常").sum())
     insufficient_count = int(history_results["数据状态"].ne("正常").sum())
@@ -648,12 +849,24 @@ def render_scan_results(payload: dict[str, object]) -> None:
 
     st.markdown('<div class="section-label">今日候选结果</div>', unsafe_allow_html=True)
     if final_results.empty:
-        st.info("今日无达到最终评分标准的股票。")
+        st.info("今日没有通过前序数据验证的真实股票，无法生成研究名单。")
     else:
+        qualified_count = int(final_results["综合得分"].ge(SCORE_MINIMUM).sum())
+        supplemental_count = len(final_results) - qualified_count
+        if len(final_results) < SCORING_MAX_RESULTS:
+            st.warning(
+                f"通过前序验证的真实股票仅 {len(final_results)} 只，"
+                f"不足 {SCORING_MAX_RESULTS} 只，未使用虚假数据补足。"
+            )
+        if supplemental_count:
+            st.warning(
+                f"名单中有 {supplemental_count} 只综合评分低于 {SCORE_MINIMUM:g} 分，"
+                "属于按得分排序的研究递补，不代表达到策略评分标准。"
+            )
         render_stock_results(final_results)
 
     excluded_results = build_excluded_results(
-        history_results, late_session_results, scoring_results
+        history_results, late_session_results, scoring_results, final_results
     )
     missing_records = build_missing_records(
         history_results, late_session_results, scoring_results
@@ -675,6 +888,118 @@ def render_scan_results(payload: dict[str, object]) -> None:
     )
 
 
+def render_history_page() -> None:
+    """查询本地 SQLite 扫描历史，并提供对比与报告下载。"""
+    st.markdown('<div class="section-label">历史扫描记录</div>', unsafe_allow_html=True)
+    st.warning(
+        "当前使用本地 SQLite 临时保存。Streamlit Community Cloud 重启、"
+        "重新部署或容器迁移后，历史数据可能被清空。"
+    )
+    st.button("返回仪表盘", on_click=queue_dashboard_action, args=("dashboard",))
+    try:
+        repository = get_scan_history_repository()
+        all_scans = repository.list_scans()
+    except Exception as error:
+        logger.exception("读取扫描历史失败")
+        st.error(f"历史记录读取失败（{type(error).__name__}），页面其他功能仍可使用。")
+        return
+
+    if not all_scans:
+        st.info("暂无历史扫描记录。完成一次今日扫描后将在此显示。")
+        return
+
+    available_dates = sorted({record["scan_date"] for record in all_scans}, reverse=True)
+    selected_date = st.date_input(
+        "按日期查询",
+        value=datetime.fromisoformat(available_dates[0]).date(),
+        min_value=datetime.fromisoformat(available_dates[-1]).date(),
+        max_value=datetime.now(MARKET_TIMEZONE).date(),
+    ).isoformat()
+    scans = repository.list_scans(selected_date)
+    if not scans:
+        st.info("该日期暂无扫描记录。")
+    else:
+        labels = {
+            record["scan_id"]: (
+                f"{datetime.fromisoformat(record['started_at']):%H:%M:%S} · "
+                f"{record['scan_id'][:8]} · {record['status']}"
+            )
+            for record in scans
+        }
+        selected_id = st.selectbox(
+            "选择某次扫描", options=list(labels), format_func=labels.get
+        )
+        record = repository.get_scan(selected_id)
+        if record:
+            counts = record["counts"]
+            metric_columns = st.columns(4)
+            metric_columns[0].metric("初筛数量", counts.get("initial", 0))
+            metric_columns[1].metric("20日涨停", counts.get("limit_up", 0))
+            metric_columns[2].metric("尾盘合格", counts.get("late_qualified", 0))
+            metric_columns[3].metric("最终Top10", counts.get("final", 0))
+            st.caption(
+                f"scan_id: {record['scan_id']} · 状态：{record['status']} · "
+                f"耗时：{record['duration_seconds']:.1f}秒 · "
+                f"数据更新：{record['data_updated_at']}"
+            )
+            with st.expander("接口健康与错误记录"):
+                st.json(record["interface_health"])
+                if record["interface_errors"]:
+                    st.warning("；".join(record["interface_errors"]))
+                else:
+                    st.success("本次扫描未记录接口错误。")
+
+            top10 = pd.DataFrame(record["final_top5"])
+            st.markdown("#### 当次最终Top10研究名单")
+            if top10.empty:
+                st.info("当次扫描没有通过前序数据验证的真实股票。")
+            else:
+                render_stock_results(top10)
+            initial = pd.DataFrame(record["initial_results"])
+            excluded = pd.DataFrame(record["excluded_results"])
+            missing = pd.DataFrame(record["missing_records"])
+            report_time = datetime.fromisoformat(record["completed_at"])
+            st.download_button(
+                "下载当次 Excel 报告",
+                data=build_strategy_report(
+                    final_top5=top10, initial_results=initial,
+                    excluded_results=excluded, missing_records=missing,
+                    strategy_parameters=record["strategy_parameters"],
+                    updated_at=report_time,
+                ),
+                file_name=f"扫描报告_{record['scan_id'][:8]}_{record['scan_date']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                width="stretch", on_click="ignore",
+            )
+
+    comparison = repository.candidate_counts_by_date()
+    st.markdown("#### 不同日期候选数量对比")
+    if comparison.empty:
+        st.info("暂无可对比数据。")
+    else:
+        st.line_chart(
+            comparison.set_index("扫描日期")[["初筛数量", "最终候选数量"]]
+        )
+        st.dataframe(comparison, width="stretch", hide_index=True)
+
+    selection_counts = repository.stock_selection_counts()
+    st.markdown("#### 股票历史入选次数")
+    if selection_counts.empty:
+        st.info("暂无股票入选记录。")
+    else:
+        st.dataframe(selection_counts, width="stretch", hide_index=True)
+
+
+def render_mobile_action_bar() -> None:
+    """窄屏幕底部快捷操作区。"""
+    disabled = bool(st.session_state.get("scan_in_progress"))
+    with st.container(key="mobile_action_bar"):
+        actions = st.columns(3)
+        actions[0].button("扫描", key="mobile_scan", type="primary", disabled=disabled, on_click=queue_dashboard_action, args=("scan",))
+        actions[1].button("刷新", key="mobile_refresh", disabled=disabled, on_click=queue_dashboard_action, args=("refresh",))
+        actions[2].button("历史", key="mobile_history", disabled=disabled, on_click=queue_dashboard_action, args=("history",))
+
+
 def render_home() -> None:
     initialize_dashboard_state()
     handle_pending_action()
@@ -690,19 +1015,37 @@ def render_home() -> None:
     )
     render_status_and_metrics(now)
 
+    if st.session_state.current_view == "history":
+        render_history_page()
+        render_mobile_action_bar()
+        st.markdown(
+            '<div class="risk-banner">本地历史数据可能在云端重启后清空；'
+            '本工具仅用于公开数据筛选和策略研究，不构成投资建议。</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
     st.markdown('<div class="section-label">今日操作</div>', unsafe_allow_html=True)
     actions = st.columns(3)
+    scanning = bool(st.session_state.scan_in_progress)
     actions[0].button(
         "开始今日扫描", type="primary", width="stretch",
         on_click=queue_dashboard_action, args=("scan",),
+        disabled=scanning,
     )
     actions[1].button(
         "刷新行情", width="stretch",
         on_click=queue_dashboard_action, args=("refresh",),
+        disabled=scanning,
     )
     actions[2].button(
         "查看历史记录", width="stretch",
         on_click=queue_dashboard_action, args=("history",),
+        disabled=scanning,
+    )
+    st.caption(
+        "同一时刻只允许一次完整扫描，扫描期间操作按钮会锁定。"
+        "当前版本不安全中断已发出的公开数据请求；需强制终止时请停止 Streamlit 进程。"
     )
 
     notice = st.session_state.dashboard_notice
@@ -716,6 +1059,8 @@ def render_home() -> None:
         st.info("点击“开始今日扫描”运行现有策略；首页不会自动请求行情。")
     else:
         render_scan_results(st.session_state.scan_payload)
+
+    render_mobile_action_bar()
 
     st.markdown(
         '<div class="risk-banner">本工具仅用于公开数据筛选和策略研究，'

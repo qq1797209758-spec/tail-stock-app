@@ -202,14 +202,22 @@ def calculate_candidate_score(
 
 
 def select_top_candidates(scored: pd.DataFrame) -> pd.DataFrame:
-    """仅保留 80 分以上，按降序返回最多 5 只。"""
+    """按综合得分返回最多10只真实候选，未达80分者明确标记为研究递补。"""
     if scored.empty:
         return scored.copy()
     selected = (
-        scored.loc[scored["综合得分"].ge(SCORE_MINIMUM)]
-        .sort_values("综合得分", ascending=False)
+        scored.sort_values("综合得分", ascending=False)
         .head(SCORING_MAX_RESULTS)
         .reset_index(drop=True)
+    )
+    below_threshold = selected["综合得分"].lt(SCORE_MINIMUM)
+    selected.loc[below_threshold, "观察标记"] = "未达80分，仅供研究"
+    selected["评分达标"] = selected["综合得分"].ge(SCORE_MINIMUM).map(
+        {True: "是", False: "否"}
+    )
+    selected["名单说明"] = "达到评分门槛"
+    selected.loc[below_threshold, "名单说明"] = (
+        "真实候选不足10只时按综合得分递补；未达80分，仅供策略研究"
     )
     selected.insert(0, "排名", range(1, len(selected) + 1))
     return selected

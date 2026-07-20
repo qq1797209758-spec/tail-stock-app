@@ -123,6 +123,7 @@ def analyze_recent_limit_up(stock_code: str) -> dict[str, object]:
             "20日涨停次数": 0,
             "数据状态": "正常",
             "涨停判断": "不符合",
+            "历史错误原因": "",
         }
 
     latest_date = limit_up_days.max().strftime("%Y-%m-%d")
@@ -132,4 +133,5 @@ def analyze_recent_limit_up(stock_code: str) -> dict[str, object]:
         "20日涨停次数": count,
         "数据状态": "正常",
         "涨停判断": "符合",
+        "历史错误原因": "",
     }

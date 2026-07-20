@@ -229,6 +229,10 @@ body {
     display: none;
 }
 
+.st-key-mobile_action_bar {
+    display: none;
+}
+
 @media (max-width: 1100px) {
     .status-grid {
         grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -242,7 +246,7 @@ body {
 @media (max-width: 767px) {
     [data-testid="stMainBlockContainer"] {
         width: 100%;
-        padding: 1rem 0.85rem 2rem;
+        padding: 1rem 0.85rem 7rem;
     }
 
     [data-testid="stHorizontalBlock"] {
@@ -375,5 +379,34 @@ body {
         font-weight: 600;
         overflow-wrap: anywhere;
         word-break: break-word;
+    }
+
+    .st-key-mobile_action_bar {
+        display: block;
+        position: fixed;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        z-index: 900;
+        padding: 0.65rem max(0.85rem, env(safe-area-inset-left)) calc(0.65rem + env(safe-area-inset-bottom));
+        border-top: 1px solid #29445b;
+        background: rgba(12, 29, 43, 0.97);
+        box-shadow: 0 -0.4rem 1.2rem rgba(0, 0, 0, 0.24);
+        backdrop-filter: blur(10px);
+    }
+
+    .st-key-mobile_action_bar [data-testid="stHorizontalBlock"] {
+        flex-direction: row !important;
+        gap: 0.5rem !important;
+    }
+
+    .st-key-mobile_action_bar [data-testid="stHorizontalBlock"] > div {
+        width: auto !important;
+        flex: 1 1 0 !important;
+    }
+
+    .st-key-mobile_action_bar button {
+        min-height: 2.8rem;
+        padding-inline: 0.5rem;
     }
 }

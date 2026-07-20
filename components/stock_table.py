@@ -164,7 +164,7 @@ def build_strategy_report(
     strategy_parameters: dict[str, object],
     updated_at: datetime,
 ) -> bytes:
-    """生成包含五个审计工作表的策略报告。"""
+    """生成包含五个审计工作表的策略报告。参数名保留用于兼容历史记录。"""
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
@@ -172,7 +172,7 @@ def build_strategy_report(
     top_columns = [
         "排名", "代码", "名称", "最新价", "综合得分", "资金表现得分",
         "板块强度得分", "技术形态得分", "尾盘结构得分", "市场情绪得分",
-        "观察标记", "入选原因", "主要风险", "次日观察条件", "数据完整度",
+        "观察标记", "评分达标", "名单说明", "入选原因", "主要风险", "次日观察条件", "数据完整度",
         "数据更新时间", "缺失项", "评分依据",
     ]
     top_report = final_top5.reindex(columns=top_columns).copy()
@@ -191,7 +191,7 @@ def build_strategy_report(
         [{"参数": key, "当前值": value} for key, value in strategy_parameters.items()]
     )
     sheets = {
-        "最终Top5": top_report,
+        "最终Top10": top_report,
         "全部初筛结果": initial_results.copy(),
         "被排除股票": excluded_results.copy(),
         "数据缺失记录": missing_records.copy(),

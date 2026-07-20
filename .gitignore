@@ -19,6 +19,9 @@ dist/
 logs/
 output/*
 !output/.gitkeep
+data/*.db
+data/*.db-*
+data/scan_history*.json
 
 # Exported data files
 *.xlsx

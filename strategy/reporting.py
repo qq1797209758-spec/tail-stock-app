@@ -18,6 +18,7 @@ def build_excluded_results(
     history_results: pd.DataFrame,
     late_session_results: pd.DataFrame,
     scoring_results: pd.DataFrame,
+    final_results: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """每只股票仅在它首次未通过的阶段记录排除原因。"""
     frames: list[pd.DataFrame] = []
@@ -53,11 +54,19 @@ def build_excluded_results(
             frames.append(output)
     if not scoring_results.empty:
         rejected = scoring_results.loc[scoring_results["综合得分"].lt(SCORE_MINIMUM)].copy()
+        if final_results is not None and not final_results.empty and "代码" in final_results:
+            selected_codes = final_results["代码"].astype("string").str.zfill(6)
+            rejected = rejected.loc[
+                ~rejected["代码"].astype("string").str.zfill(6).isin(selected_codes)
+            ]
         if not rejected.empty:
             output = _selected_columns(rejected)
             output["排除阶段"] = "综合评分"
             output["排除原因"] = rejected["综合得分"].map(
-                lambda score: f"综合得分 {float(score):.2f} 低于 {SCORE_MINIMUM:g} 分"
+                lambda score: (
+                    f"综合得分 {float(score):.2f} 低于 {SCORE_MINIMUM:g} 分，"
+                    "且未进入前10名研究名单"
+                )
             ).values
             frames.append(output)
     columns = ["代码", "名称", "最新价", "综合得分", "排除阶段", "排除原因"]
@@ -75,7 +84,7 @@ def build_missing_records(
     records: list[dict[str, object]] = []
     for _, row in history_results.iterrows():
         if row.get("数据状态") != "正常":
-            records.append({"阶段": "20日涨停验证", "代码": row.get("代码"), "名称": row.get("名称"), "缺失或异常": row.get("数据状态")})
+            records.append({"阶段": "20日涨停验证", "代码": row.get("代码"), "名称": row.get("名称"), "缺失或异常": _text(row.get("历史错误原因"), _text(row.get("数据状态")))})
     for _, row in late_session_results.iterrows():
         if row.get("尾盘结构状态") == "无法验证":
             records.append({"阶段": "尾盘结构", "代码": row.get("代码"), "名称": row.get("名称"), "缺失或异常": row.get("淘汰原因", row.get("尾盘排除原因"))})
