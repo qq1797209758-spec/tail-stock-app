@@ -1,6 +1,8 @@
 """A股尾盘策略筛选 Web 应用。"""
 
-from datetime import datetime
+from datetime import datetime, time as clock_time
+from html import escape
+from pathlib import Path
 import time
 from zoneinfo import ZoneInfo
 
@@ -68,6 +70,9 @@ from utils.logger import get_logger
 
 
 logger = get_logger(__name__)
+BASE_DIR = Path(__file__).resolve().parent
+CSS_FILE = BASE_DIR / "assets" / "styles.css"
+MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 @st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
@@ -100,71 +105,14 @@ def load_stock_scoring_context(stock_code: str) -> dict[str, object]:
 
 
 def apply_responsive_styles() -> None:
-    st.markdown(
-        """
-        <style>
-        html, body { max-width: 100%; }
-        [data-testid="stMainBlockContainer"] {
-            width: 100%; max-width: none;
-            padding: 2rem clamp(1rem, 3vw, 3rem) 3rem;
-        }
-        [data-testid="stMetric"] {
-            border: 1px solid rgba(128,128,128,.22); border-radius: 14px;
-            padding: 1rem; background: rgba(128,128,128,.05);
-        }
-        [data-testid="stAlert"] { border-radius: 12px; }
-        .stock-desktop-table {
-            width: 100%; max-width: 100%; overflow-x: auto; margin-top: .5rem;
-            -webkit-overflow-scrolling: touch; overscroll-behavior-inline: contain;
-        }
-        .stock-desktop-table table { width: 100%; border-collapse: collapse; font-size: .92rem; }
-        .stock-desktop-table th { background: #eaf2f8; color: #17324d; text-align: left; }
-        .stock-desktop-table th, .stock-desktop-table td {
-            padding: .72rem .8rem; border-bottom: 1px solid rgba(128,128,128,.2); white-space: nowrap;
-        }
-        .stock-mobile-cards { display: none; }
-        @media (max-width: 767px) {
-            [data-testid="stMainBlockContainer"] { width: 100%; padding: 1rem .85rem 2rem; }
-            h1 { font-size: 1.65rem !important; line-height: 1.3 !important; }
-            h2 { font-size: 1.3rem !important; line-height: 1.35 !important; }
-            h3 { font-size: 1.12rem !important; line-height: 1.4 !important; }
-            p, li, label, button { font-size: 1rem !important; line-height: 1.55 !important; }
-            [data-testid="stHorizontalBlock"] {
-                flex-direction: column !important; gap: .75rem !important;
-            }
-            [data-testid="stHorizontalBlock"] > div {
-                width: 100% !important; min-width: 0 !important; flex: 1 1 100% !important;
-            }
-            [data-testid="stMetric"] { padding: .85rem; width: 100%; }
-            [data-testid="stButton"], [data-testid="stDownloadButton"] { width: 100%; }
-            [data-testid="stButton"] button,
-            [data-testid="stDownloadButton"] button {
-                width: 100% !important; min-height: 2.8rem; padding: .7rem 1rem;
-                touch-action: manipulation;
-            }
-            .stock-desktop-table { display: none; }
-            .stock-mobile-cards { display: grid; gap: .75rem; }
-            .stock-card {
-                width: 100%; min-width: 0; padding: 1rem;
-                border: 1px solid rgba(128,128,128,.22);
-                border-radius: 14px; background: rgba(128,128,128,.04);
-            }
-            .stock-card-title { display: flex; justify-content: space-between; gap: 1rem; margin-bottom: .8rem; }
-            .stock-card-title strong, .stock-card-title span { overflow-wrap: anywhere; }
-            .stock-card-title span { color: #617181; font-variant-numeric: tabular-nums; }
-            .stock-card-grid { display: grid; grid-template-columns: 1fr; gap: .7rem; }
-            .stock-card-grid div {
-                display: grid; grid-template-columns: minmax(7rem, 42%) minmax(0, 1fr);
-                align-items: start; gap: .6rem; padding-bottom: .55rem;
-                border-bottom: 1px solid rgba(128,128,128,.14);
-            }
-            .stock-card-grid small { color: #617181; margin-bottom: .15rem; }
-            .stock-card-grid b { font-weight: 600; overflow-wrap: anywhere; word-break: break-word; }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+    """从单一文件加载全站样式。"""
+    try:
+        css = CSS_FILE.read_text(encoding="utf-8")
+    except OSError:
+        logger.exception("无法加载仪表盘样式")
+        st.warning("页面样式暂时无法加载，核心功能仍可使用。")
+        return
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 
 
 def render_strategy_sidebar() -> None:
@@ -387,86 +335,238 @@ def apply_candidate_scoring(candidates, market_data):
     return scored, selected.reset_index(drop=True)
 
 
-def render_home() -> None:
-    st.title(APP_TITLE)
-    st.caption(APP_DESCRIPTION)
-    st.warning(
-        "本工具仅用于公开行情数据的筛选与分析，不是自动交易软件，"
-        "不构成投资建议，也不承诺任何收益。"
-    )
-    st.write("点击开始扫描后，系统才会请求 AKShare 全 A 股实时行情。")
+def initialize_dashboard_state() -> None:
+    defaults = {
+        "pending_action": None,
+        "last_data_update": None,
+        "data_source_status": "待连接",
+        "market_stock_count": None,
+        "first_round_count": None,
+        "final_candidate_count": None,
+        "highest_score": None,
+        "scan_payload": None,
+        "dashboard_notice": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-    if not st.button("开始扫描", type="primary", width="stretch"):
-        st.info("尚未扫描。策略条件可在左侧栏查看。")
-        return
 
+def queue_dashboard_action(action: str) -> None:
+    st.session_state.pending_action = action
+
+
+def get_market_status(now: datetime) -> tuple[str, str]:
+    """根据北京时间给出基础交易时段状态，不推断节假日。"""
+    if now.weekday() >= 5:
+        return "已收盘", "status-warn"
+    current_time = now.time()
+    if current_time < clock_time.fromisoformat("09:30:00"):
+        return "未开盘", "status-warn"
+    if current_time <= clock_time.fromisoformat("11:30:00"):
+        return "交易中", "status-live"
+    if current_time < clock_time.fromisoformat("13:00:00"):
+        return "午间休市", "status-warn"
+    if current_time <= clock_time.fromisoformat("15:00:00"):
+        return "交易中", "status-live"
+    return "已收盘", "status-warn"
+
+
+def _format_metric(value: object, suffix: str = "") -> str:
+    if value is None or pd.isna(value):
+        return "--"
+    if isinstance(value, float):
+        return f"{value:.2f}{suffix}"
+    return f"{int(value):,}{suffix}"
+
+
+def refresh_market_snapshot() -> None:
     try:
-        with st.spinner("正在获取行情并执行筛选，请稍候……"):
+        with st.spinner("正在刷新全市场行情……"):
+            load_market_data.clear()
+            market_data, updated_at = load_market_data()
+        st.session_state.last_data_update = updated_at
+        source = market_data.attrs.get("data_source", "AKShare")
+        st.session_state.data_source_status = f"正常 · {source}"
+        st.session_state.market_stock_count = len(market_data)
+        st.session_state.first_round_count = None
+        st.session_state.final_candidate_count = None
+        st.session_state.highest_score = None
+        st.session_state.scan_payload = None
+        if market_data.attrs.get("is_fallback"):
+            st.session_state.dashboard_notice = (
+                "warning",
+                "东方财富接口暂时不可用，已切换至 AKShare 新浪备用源。"
+                "备用源缺少量比、换手率和总市值，可查看行情，但不会将数据不足的股票判定为策略合格。",
+            )
+        else:
+            st.session_state.dashboard_notice = ("success", "行情刷新成功，可以开始今日扫描。")
+    except MarketDataError as error:
+        logger.exception("刷新行情失败")
+        st.session_state.data_source_status = "异常"
+        st.session_state.dashboard_notice = ("error", f"行情刷新失败：{error}")
+    except Exception as error:
+        logger.exception("刷新行情发生未知错误")
+        st.session_state.data_source_status = "异常"
+        st.session_state.dashboard_notice = (
+            "error",
+            f"行情刷新失败（{type(error).__name__}），详细信息已记录。",
+        )
+
+
+def run_today_scan() -> None:
+    try:
+        with st.spinner("正在获取行情并执行现有策略流程，请稍候……"):
             market_data, updated_at = load_market_data()
             filter_result = apply_filters(market_data)
+        history_results, limit_up_results = apply_limit_up_filter(filter_result.final)
+        late_session_results, late_qualified = apply_late_session_filter(
+            limit_up_results
+        )
+        scoring_results, final_results = apply_candidate_scoring(
+            late_qualified, market_data
+        )
     except MarketDataError as error:
         logger.exception("AKShare 行情连接失败")
-        st.error(f"扫描失败：{error}")
-        st.info("请检查网络后重试；免费公开接口也可能暂时限流或维护。")
+        st.session_state.data_source_status = "异常"
+        st.session_state.dashboard_notice = ("error", f"扫描失败：{error}")
         return
     except Exception as error:
-        logger.exception("策略扫描失败")
-        st.error(f"扫描失败：{type(error).__name__}")
-        st.info("详细错误已写入本地日志，页面仍可继续使用。")
+        logger.exception("今日扫描失败")
+        st.session_state.data_source_status = "异常"
+        st.session_state.dashboard_notice = (
+            "error",
+            f"扫描失败（{type(error).__name__}），详细信息已记录，页面仍可使用。",
+        )
         return
 
-    history_results, limit_up_results = apply_limit_up_filter(filter_result.final)
-    late_session_results, late_qualified = apply_late_session_filter(limit_up_results)
-    scoring_results, final_results = apply_candidate_scoring(
-        late_qualified, market_data
+    highest_score = None
+    if not scoring_results.empty and "综合得分" in scoring_results:
+        score_values = pd.to_numeric(scoring_results["综合得分"], errors="coerce")
+        if score_values.notna().any():
+            highest_score = float(score_values.max())
+
+    st.session_state.last_data_update = updated_at
+    source = market_data.attrs.get("data_source", "AKShare")
+    st.session_state.data_source_status = f"正常 · {source}"
+    st.session_state.market_stock_count = len(market_data)
+    st.session_state.first_round_count = len(filter_result.final)
+    st.session_state.final_candidate_count = len(final_results)
+    st.session_state.highest_score = highest_score
+    st.session_state.scan_payload = {
+        "updated_at": updated_at,
+        "history_results": history_results,
+        "limit_up_results": limit_up_results,
+        "late_session_results": late_session_results,
+        "late_qualified": late_qualified,
+        "scoring_results": scoring_results,
+        "final_results": final_results,
+    }
+    st.session_state.dashboard_notice = ("success", "今日扫描已完成。")
+
+
+def handle_pending_action() -> None:
+    action = st.session_state.pending_action
+    st.session_state.pending_action = None
+    if action == "scan":
+        run_today_scan()
+    elif action == "refresh":
+        refresh_market_snapshot()
+    elif action == "history":
+        st.session_state.dashboard_notice = (
+            "info",
+            "历史记录将在 V2 后续阶段接入；当前版本不会生成虚假历史数据。",
+        )
+
+
+def render_status_and_metrics(now: datetime) -> None:
+    market_status, market_status_class = get_market_status(now)
+    updated_at = st.session_state.last_data_update
+    updated_text = updated_at.strftime("%m-%d %H:%M:%S") if updated_at else "--"
+    source_status = str(st.session_state.data_source_status)
+    source_class = (
+        "status-live" if source_status.startswith("正常")
+        else "status-error" if source_status == "异常"
+        else "status-warn"
+    )
+    status_items = [
+        ("当前日期", now.strftime("%Y-%m-%d"), ""),
+        ("当前时间", now.strftime("%H:%M:%S"), ""),
+        ("A股市场状态", market_status, market_status_class),
+        ("最近数据更新时间", updated_text, ""),
+        ("数据源状态", source_status, source_class),
+    ]
+    status_html = "".join(
+        f'<div class="status-card"><span class="status-label">{escape(label)}</span>'
+        f'<strong class="status-value {css_class}">{escape(value)}</strong></div>'
+        for label, value, css_class in status_items
+    )
+    st.markdown(f'<div class="status-grid">{status_html}</div>', unsafe_allow_html=True)
+
+    metrics = [
+        ("全市场股票数量", _format_metric(st.session_state.market_stock_count)),
+        ("第一轮符合数量", _format_metric(st.session_state.first_round_count)),
+        ("最终候选数量", _format_metric(st.session_state.final_candidate_count)),
+        ("今日最高综合评分", _format_metric(st.session_state.highest_score, "分")),
+    ]
+    metric_html = "".join(
+        f'<div class="metric-card"><span class="metric-label">{escape(label)}</span>'
+        f'<strong class="metric-value">{escape(value)}</strong></div>'
+        for label, value in metrics
+    )
+    st.markdown(f'<div class="metric-grid">{metric_html}</div>', unsafe_allow_html=True)
+
+
+def render_strategy_flow() -> None:
+    steps = [
+        "主板过滤", "排除ST", "涨幅筛选", "量比与换手率",
+        "市值筛选", "20日涨停", "尾盘结构", "综合评分",
+    ]
+    parts = []
+    for index, step in enumerate(steps):
+        parts.append(f'<div class="flow-step">{escape(step)}</div>')
+        if index < len(steps) - 1:
+            parts.append('<div class="flow-arrow">→</div>')
+    st.markdown(
+        '<div class="section-label">策略流程</div>'
+        f'<div class="strategy-flow">{"".join(parts)}</div>',
+        unsafe_allow_html=True,
     )
 
-    metrics = st.columns(5)
-    metrics[0].metric("原始股票数量", f"{len(market_data):,}")
-    metrics[1].metric("初筛数量", f"{len(filter_result.final):,}")
-    metrics[2].metric("涨停筛选", f"{len(limit_up_results):,}")
-    metrics[3].metric("尾盘合格", f"{len(late_qualified):,}")
-    metrics[4].metric("最终数量", f"{len(final_results):,}")
-    st.caption(f"数据更新时间：{updated_at:%Y-%m-%d %H:%M:%S}（北京时间）")
+
+def render_scan_results(payload: dict[str, object]) -> None:
+    updated_at = payload["updated_at"]
+    history_results = payload["history_results"]
+    late_session_results = payload["late_session_results"]
+    scoring_results = payload["scoring_results"]
+    final_results = payload["final_results"]
 
     insufficient_count = int(history_results["涨停判断"].eq("数据不足").sum())
     if insufficient_count:
-        st.warning(
-            f"有 {insufficient_count} 只股票因历史数据不足或请求失败未能可靠判断，"
-            "已跳过且未计入最终结果。"
-        )
+        st.warning(f"{insufficient_count} 只股票历史数据不足，未计入最终结果。")
 
     unverifiable_count = int(
         late_session_results["尾盘结构状态"].eq("无法验证").sum()
     )
     if unverifiable_count:
-        st.warning(
-            f"有 {unverifiable_count} 只股票的免费分钟数据不完整，尾盘结构标记为"
-            "“无法验证”，未计入最终结果。"
-        )
+        st.warning(f"{unverifiable_count} 只股票尾盘结构无法验证，未计入最终结果。")
 
     st.info(
-        "尾盘结构为免费分钟行情的近似判断；VWAP为根据分钟成交额和成交量计算的"
-        "“VWAP近似黄线”，不等同于交易软件或交易所逐笔数据。"
+        "尾盘结构基于免费分钟行情近似判断；VWAP为“VWAP近似黄线”，"
+        "不等同于交易所逐笔数据。"
     )
-
     if not late_session_results.empty:
-        with st.expander("查看全部尾盘结构分析（含排除与无法验证）"):
+        with st.expander("查看全部尾盘结构分析"):
             render_stock_results(late_session_results)
-
     if not scoring_results.empty:
-        with st.expander("查看全部评分明细（含80分以下）"):
+        with st.expander("查看全部评分明细"):
             render_stock_results(scoring_results)
 
+    st.markdown('<div class="section-label">今日候选结果</div>', unsafe_allow_html=True)
     if final_results.empty:
         st.info("今日暂无符合条件股票")
         return
 
-    st.subheader("筛选结果")
-    st.caption(
-        "按资金30分、板块20分、技术20分、尾盘20分、市场情绪10分计算，"
-        "结果按综合得分降序排列，最多展示5只。"
-    )
     render_stock_results(final_results)
     st.download_button(
         "下载筛选结果 Excel",
@@ -484,11 +584,54 @@ def render_home() -> None:
         width="stretch",
         on_click="ignore",
     )
-    st.caption("结果仅来自本次实时行情筛选，未生成或补充任何虚假股票。")
-    st.warning(
-        "所有观察条件、价格和买卖区间（如后续展示）均仅作策略参考，"
-        "不构成投资建议或收益承诺。"
+
+
+def render_home() -> None:
+    initialize_dashboard_state()
+    handle_pending_action()
+    now = datetime.now(MARKET_TIMEZONE)
+
+    st.markdown(
+        '<section class="dashboard-hero">'
+        '<p class="dashboard-eyebrow">V2.0 · Market Intelligence</p>'
+        f'<h1 class="dashboard-title">{escape(APP_TITLE)}</h1>'
+        f'<p class="dashboard-subtitle">{escape(APP_DESCRIPTION)}</p>'
+        '</section>',
+        unsafe_allow_html=True,
     )
+    render_status_and_metrics(now)
+
+    st.markdown('<div class="section-label">今日操作</div>', unsafe_allow_html=True)
+    actions = st.columns(3)
+    actions[0].button(
+        "开始今日扫描", type="primary", width="stretch",
+        on_click=queue_dashboard_action, args=("scan",),
+    )
+    actions[1].button(
+        "刷新行情", width="stretch",
+        on_click=queue_dashboard_action, args=("refresh",),
+    )
+    actions[2].button(
+        "查看历史记录", width="stretch",
+        on_click=queue_dashboard_action, args=("history",),
+    )
+
+    notice = st.session_state.dashboard_notice
+    if notice:
+        level, message = notice
+        getattr(st, level)(message)
+
+    st.markdown(
+        '<div class="risk-banner">本工具仅用于公开数据筛选和策略研究，'
+        '不构成任何投资建议。</div>',
+        unsafe_allow_html=True,
+    )
+    render_strategy_flow()
+
+    if st.session_state.scan_payload is None:
+        st.info("点击“开始今日扫描”运行现有策略；首页不会自动请求行情。")
+    else:
+        render_scan_results(st.session_state.scan_payload)
 
 
 def main() -> None:

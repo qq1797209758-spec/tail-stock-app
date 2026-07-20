@@ -7,9 +7,9 @@ port = 8501
 gatherUsageStats = false
 
 [theme]
-base = "light"
-primaryColor = "#146C94"
-backgroundColor = "#F8FAFC"
-secondaryBackgroundColor = "#EAF2F8"
-textColor = "#14212B"
+base = "dark"
+primaryColor = "#4DB8F5"
+backgroundColor = "#0B1623"
+secondaryBackgroundColor = "#101F2E"
+textColor = "#E4EDF4"
 font = "sans serif"

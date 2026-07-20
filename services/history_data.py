@@ -10,6 +10,7 @@ from config import (
     HISTORY_TRADING_DAYS,
     LIMIT_UP_CHANGE_THRESHOLD,
 )
+from services.network import call_with_proxy_fallback
 
 
 class HistoryDataError(RuntimeError):
@@ -22,12 +23,14 @@ def analyze_recent_limit_up(stock_code: str) -> dict[str, str]:
     start_date = end_date - timedelta(days=HISTORY_CALENDAR_LOOKBACK_DAYS)
 
     try:
-        history = ak.stock_zh_a_hist(
-            symbol=str(stock_code).zfill(6),
-            period="daily",
-            start_date=start_date.strftime("%Y%m%d"),
-            end_date=end_date.strftime("%Y%m%d"),
-            adjust="",
+        history = call_with_proxy_fallback(
+            lambda: ak.stock_zh_a_hist(
+                symbol=str(stock_code).zfill(6),
+                period="daily",
+                start_date=start_date.strftime("%Y%m%d"),
+                end_date=end_date.strftime("%Y%m%d"),
+                adjust="",
+            )
         )
     except Exception as error:
         raise HistoryDataError(

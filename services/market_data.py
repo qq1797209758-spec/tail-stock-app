@@ -1,7 +1,14 @@
 """AKShare 市场行情访问服务。"""
 
+import logging
+
 import akshare as ak
 import pandas as pd
+
+from services.network import call_with_proxy_fallback
+
+
+logger = logging.getLogger(__name__)
 
 
 class MarketDataError(RuntimeError):
@@ -11,12 +18,21 @@ class MarketDataError(RuntimeError):
 def fetch_a_share_spot() -> pd.DataFrame:
     """获取全 A 股实时行情，并返回独立的 DataFrame。"""
     try:
-        data = ak.stock_zh_a_spot_em()
-    except Exception as error:
-        error_type = type(error).__name__
-        raise MarketDataError(
-            f"AKShare 行情请求失败（错误类型：{error_type}）"
-        ) from error
+        data = call_with_proxy_fallback(ak.stock_zh_a_spot_em)
+        source = "AKShare · 东方财富"
+    except Exception as primary_error:
+        logger.warning(
+            "东方财富实时行情不可用，尝试 AKShare 新浪备用源：%s",
+            type(primary_error).__name__,
+        )
+        try:
+            data = call_with_proxy_fallback(ak.stock_zh_a_spot)
+            source = "AKShare · 新浪备用源"
+        except Exception as fallback_error:
+            raise MarketDataError(
+                "AKShare 主用和备用行情源均请求失败"
+                f"（{type(primary_error).__name__} / {type(fallback_error).__name__}）"
+            ) from fallback_error
 
     if not isinstance(data, pd.DataFrame):
         raise MarketDataError("行情接口未返回 pandas DataFrame")
@@ -38,7 +54,10 @@ def fetch_a_share_spot() -> pd.DataFrame:
     ]
     for column in numeric_columns:
         if column not in result.columns:
-            raise MarketDataError(f"行情数据缺少必要字段：{column}")
+            # 备用源不提供全部策略字段；保留缺失值，由筛选层如实排除。
+            result[column] = pd.NA
         result[column] = pd.to_numeric(result[column], errors="coerce")
 
+    result.attrs["data_source"] = source
+    result.attrs["is_fallback"] = "备用源" in source
     return result

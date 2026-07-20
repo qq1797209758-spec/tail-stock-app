@@ -3,6 +3,8 @@
 import akshare as ak
 import pandas as pd
 
+from services.network import call_with_proxy_fallback
+
 
 class ScoringDataError(RuntimeError):
     """评分附加数据请求失败。"""
@@ -11,7 +13,9 @@ class ScoringDataError(RuntimeError):
 def fetch_industry_strength() -> pd.DataFrame:
     """获取行业当日涨跌幅。"""
     try:
-        data = ak.stock_fund_flow_industry(symbol="即时")
+        data = call_with_proxy_fallback(
+            lambda: ak.stock_fund_flow_industry(symbol="即时")
+        )
     except Exception as error:
         raise ScoringDataError(
             f"行业强度请求失败（{type(error).__name__}）"
@@ -35,7 +39,9 @@ def fetch_stock_scoring_context(stock_code: str) -> dict[str, object]:
     }
 
     try:
-        profile = ak.stock_profile_cninfo(symbol=code)
+        profile = call_with_proxy_fallback(
+            lambda: ak.stock_profile_cninfo(symbol=code)
+        )
         if isinstance(profile, pd.DataFrame) and not profile.empty and "所属行业" in profile:
             industry = profile.iloc[0]["所属行业"]
             if pd.notna(industry) and str(industry).strip():
@@ -49,7 +55,9 @@ def fetch_stock_scoring_context(stock_code: str) -> dict[str, object]:
 
     market = "sh" if code.startswith("6") else "sz"
     try:
-        fund_flow = ak.stock_individual_fund_flow(stock=code, market=market)
+        fund_flow = call_with_proxy_fallback(
+            lambda: ak.stock_individual_fund_flow(stock=code, market=market)
+        )
         if (
             isinstance(fund_flow, pd.DataFrame)
             and not fund_flow.empty

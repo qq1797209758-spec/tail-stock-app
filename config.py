@@ -1,7 +1,7 @@
 """应用基础配置。"""
 
-APP_TITLE = "A股尾盘策略筛选"
-APP_DESCRIPTION = "免费公开行情数据的筛选与分析工具"
+APP_TITLE = "A股尾盘策略筛选系统"
+APP_DESCRIPTION = "基于公开行情数据的尾盘策略辅助分析工具"
 DATA_CACHE_TTL = 60
 
 # 第一版尾盘筛选条件

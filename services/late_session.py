@@ -21,6 +21,7 @@ from config import (
     LATE_VWAP_ABOVE_RATIO_MIN,
     MINUTE_VOLUME_SHARE_MULTIPLIER,
 )
+from services.network import call_with_proxy_fallback
 
 
 class LateSessionDataError(RuntimeError):
@@ -49,12 +50,14 @@ def analyze_late_session(stock_code: str) -> dict[str, object]:
         raise LateSessionDataError("当前尚未到达尾盘分析时段")
 
     try:
-        minute_data = ak.stock_zh_a_hist_min_em(
-            symbol=str(stock_code).zfill(6),
-            start_date=query_start.strftime("%Y-%m-%d %H:%M:%S"),
-            end_date=query_end.strftime("%Y-%m-%d %H:%M:%S"),
-            period="1",
-            adjust="",
+        minute_data = call_with_proxy_fallback(
+            lambda: ak.stock_zh_a_hist_min_em(
+                symbol=str(stock_code).zfill(6),
+                start_date=query_start.strftime("%Y-%m-%d %H:%M:%S"),
+                end_date=query_end.strftime("%Y-%m-%d %H:%M:%S"),
+                period="1",
+                adjust="",
+            )
         )
     except Exception as error:
         raise LateSessionDataError(
