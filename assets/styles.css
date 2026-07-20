@@ -317,7 +317,28 @@ body {
         display: flex;
         justify-content: space-between;
         gap: 1rem;
+        cursor: pointer;
+        list-style: none;
+        touch-action: manipulation;
+    }
+
+    .stock-card-title::-webkit-details-marker {
+        display: none;
+    }
+
+    .stock-card-title::after {
+        content: "+";
+        color: #5db8ee;
+        font-size: 1.2rem;
+        line-height: 1;
+    }
+
+    .stock-card[open] .stock-card-title {
         margin-bottom: 0.8rem;
+    }
+
+    .stock-card[open] .stock-card-title::after {
+        content: "−";
     }
 
     .stock-card-title strong,

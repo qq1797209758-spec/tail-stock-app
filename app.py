@@ -29,10 +29,11 @@ from config import (
     MARKET_CAP_UNIT,
     LIMIT_UP_PRICE_TOLERANCE,
     MAIN_BOARD_LIMIT_UP_RATE,
+    LATE_DATA_COMPLETENESS_MIN,
     LATE_LAST_MINUTES,
+    LATE_LAST_MINUTES_MAX_DROP,
     LATE_MAX_DRAWDOWN,
     LATE_RAPID_DROP_MAX_CONSECUTIVE,
-    LATE_RAPID_DROP_PER_MINUTE,
     LATE_SESSION_START_TIME,
     LATE_VOLUME_EXPANSION_RATIO,
     LATE_VWAP_ABOVE_RATIO_MIN,
@@ -60,7 +61,11 @@ from config import (
 )
 from services.market_data import MarketDataError, fetch_a_share_spot
 from services.history_data import HistoryDataError, analyze_recent_limit_up
-from services.late_session import LateSessionDataError, analyze_late_session
+from services.late_session import (
+    LateSessionDataError,
+    analyze_late_session,
+    unverifiable_late_session_result,
+)
 from services.scoring_data import (
     ScoringDataError,
     fetch_industry_strength,
@@ -148,11 +153,12 @@ def render_strategy_sidebar() -> None:
         st.write(f"**分析起点：** {LATE_SESSION_START_TIME[:5]}")
         st.write(f"**VWAP要求：** 上方分钟占比 ≥ {LATE_VWAP_ABOVE_RATIO_MIN:.0%}")
         st.write(f"**最大回撤：** ≤ {LATE_MAX_DRAWDOWN:.1%}")
+        st.write(f"**最后10分钟：** 跌幅不超过 {abs(LATE_LAST_MINUTES_MAX_DROP):.1%}")
         st.write(
-            f"**快速下跌：** 单分钟 ≤ {LATE_RAPID_DROP_PER_MINUTE:.1%}，"
-            f"最多连续 {LATE_RAPID_DROP_MAX_CONSECUTIVE} 次"
+            f"**连续走弱：** 最多 {LATE_RAPID_DROP_MAX_CONSECUTIVE} 分钟"
         )
-        st.write(f"**量能放大：** 尾盘/此前均量 ≥ {LATE_VOLUME_EXPANSION_RATIO:g} 倍")
+        st.write(f"**数据完整性：** ≥ {LATE_DATA_COMPLETENESS_MIN:.0%}")
+        st.write(f"**量能放大：** 尾盘/14:30前30分钟均量 ≥ {LATE_VOLUME_EXPANSION_RATIO:g} 倍")
         st.divider()
         st.write("**综合评分：** 资金30 + 板块20 + 技术20 + 尾盘20 + 情绪10")
         st.write(f"**入选门槛：** ≥ {SCORE_MINIMUM:g} 分")
@@ -247,9 +253,12 @@ def apply_late_session_filter(candidates):
     """仅对涨停条件通过的候选股执行免费分钟数据近似分析。"""
     if candidates.empty:
         empty = candidates.copy()
-        empty["尾盘结构状态"] = pd.Series(dtype="string")
-        empty["尾盘结构评分"] = pd.Series(dtype="float64")
-        empty["尾盘排除原因"] = pd.Series(dtype="string")
+        for field in (
+            "尾盘结构状态", "VWAP状态", "高于VWAP占比", "尾盘最大回撤",
+            "最后10分钟涨跌幅", "连续走弱状态", "尾盘成交量状态",
+            "尾盘结构评分", "淘汰原因", "数据完整性", "尾盘排除原因",
+        ):
+            empty[field] = pd.Series(dtype="object")
         return empty, empty.copy()
 
     processed_rows = []
@@ -267,18 +276,12 @@ def apply_late_session_filter(candidates):
             result = load_late_session_result(stock_code)
         except LateSessionDataError as error:
             logger.warning("股票 %s 尾盘结构无法验证：%s", stock_code, error)
-            result = {
-                "尾盘结构状态": "无法验证",
-                "尾盘结构评分": pd.NA,
-                "尾盘排除原因": str(error),
-            }
+            result = unverifiable_late_session_result(str(error))
         except Exception as error:
             logger.exception("股票 %s 尾盘结构发生未知错误", stock_code)
-            result = {
-                "尾盘结构状态": "无法验证",
-                "尾盘结构评分": pd.NA,
-                "尾盘排除原因": f"未知错误（{type(error).__name__}）",
-            }
+            result = unverifiable_late_session_result(
+                f"未知错误（{type(error).__name__}）"
+            )
 
         output_row = row.copy()
         for key, value in result.items():
@@ -602,10 +605,14 @@ def render_scan_results(payload: dict[str, object]) -> None:
     )
     if unverifiable_count:
         st.warning(f"{unverifiable_count} 只股票尾盘结构无法验证，未计入最终结果。")
+        if late_session_results["淘汰原因"].astype("string").str.contains(
+            "尚未进入尾盘分析时段", na=False
+        ).any():
+            st.info("当前尚未进入14:30–15:00尾盘分析时段。")
 
     st.info(
-        "尾盘结构基于免费分钟行情近似判断；VWAP为“VWAP近似黄线”，"
-        "不等同于交易所逐笔数据。"
+        "VWAP为公开分钟成交额和成交量计算的近似均价线，"
+        "不是交易所 Level-2 黄线数据。"
     )
     if not late_session_results.empty:
         with st.expander("查看全部尾盘结构分析"):

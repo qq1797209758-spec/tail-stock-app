@@ -19,7 +19,15 @@ DISPLAY_COLUMNS = [
     "总市值",
     "最近涨停日期",
     "尾盘结构状态",
+    "VWAP状态",
+    "高于VWAP占比",
+    "尾盘最大回撤",
+    "最后10分钟涨跌幅",
+    "连续走弱状态",
+    "尾盘成交量状态",
     "尾盘结构评分",
+    "淘汰原因",
+    "数据完整性",
     "尾盘排除原因",
     "综合得分",
     "观察标记",
@@ -79,6 +87,10 @@ def _format_display_value(column: str, value: object) -> str:
     }
     if column == "尾盘结构评分":
         return _format_number(value, 0)
+    if column in {
+        "高于VWAP占比", "尾盘最大回撤", "最后10分钟涨跌幅", "数据完整性",
+    }:
+        return f"{float(value):.1%}"
     if column in numeric_columns:
         return _format_number(value)
     return escape(str(value))
@@ -105,12 +117,12 @@ def render_stock_results(data: pd.DataFrame) -> None:
         )
         cards.append(
             f"""
-            <article class="stock-card">
-                <div class="stock-card-title">
+            <details class="stock-card">
+                <summary class="stock-card-title">
                     <strong>{name}</strong><span>{code}</span>
-                </div>
+                </summary>
                 <div class="stock-card-grid">{card_fields}</div>
-            </article>
+            </details>
             """
         )
 
