@@ -9,7 +9,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from components.stock_table import build_excel, render_stock_results
+import config as strategy_settings
+from components.stock_table import build_strategy_report, render_stock_results
 from config import (
     APP_DESCRIPTION,
     APP_TITLE,
@@ -73,11 +74,25 @@ from services.scoring_data import (
     match_industry_change,
 )
 from strategy.filters import apply_filters
+from strategy.reporting import build_excluded_results, build_missing_records
 from strategy.scoring import calculate_candidate_score, select_top_candidates
 from utils.logger import get_logger
 
 
 logger = get_logger(__name__)
+
+
+def get_strategy_parameter_snapshot() -> dict[str, object]:
+    """返回当前扫描所有可审计的配置快照。"""
+    snapshot: dict[str, object] = {}
+    for name, value in vars(strategy_settings).items():
+        if not name.isupper() or name.startswith("APP_"):
+            continue
+        if isinstance(value, tuple):
+            snapshot[name] = "、".join(str(item) for item in value)
+        elif isinstance(value, (str, int, float, bool)):
+            snapshot[name] = value
+    return snapshot
 BASE_DIR = Path(__file__).resolve().parent
 CSS_FILE = BASE_DIR / "assets" / "styles.css"
 MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -297,7 +312,7 @@ def apply_late_session_filter(candidates):
     return processed, qualified.reset_index(drop=True)
 
 
-def apply_candidate_scoring(candidates, market_data):
+def apply_candidate_scoring(candidates, market_data, updated_at):
     """对尾盘结构合格股票进行可审计评分并返回 Top 5。"""
     if candidates.empty:
         empty = candidates.copy()
@@ -362,6 +377,7 @@ def apply_candidate_scoring(candidates, market_data):
     scored = pd.DataFrame(scored_rows).sort_values(
         "综合得分", ascending=False
     ).reset_index(drop=True)
+    scored["数据更新时间"] = updated_at.strftime("%Y-%m-%d %H:%M:%S")
     selected = select_top_candidates(scored)
     return scored, selected.reset_index(drop=True)
 
@@ -455,7 +471,7 @@ def run_today_scan() -> None:
             limit_up_results
         )
         scoring_results, final_results = apply_candidate_scoring(
-            late_qualified, market_data
+            late_qualified, market_data, updated_at
         )
     except MarketDataError as error:
         logger.exception("AKShare 行情连接失败")
@@ -487,6 +503,7 @@ def run_today_scan() -> None:
     st.session_state.scan_payload = {
         "updated_at": updated_at,
         "initial_filter_count": len(filter_result.final),
+        "initial_results": filter_result.final,
         "history_results": history_results,
         "limit_up_results": limit_up_results,
         "late_session_results": late_session_results,
@@ -569,6 +586,7 @@ def render_strategy_flow() -> None:
 def render_scan_results(payload: dict[str, object]) -> None:
     updated_at = payload["updated_at"]
     history_results = payload["history_results"]
+    initial_results = payload.get("initial_results", history_results)
     limit_up_results = payload["limit_up_results"]
     late_session_results = payload["late_session_results"]
     scoring_results = payload["scoring_results"]
@@ -605,7 +623,14 @@ def render_scan_results(payload: dict[str, object]) -> None:
     )
     if unverifiable_count:
         st.warning(f"{unverifiable_count} 只股票尾盘结构无法验证，未计入最终结果。")
-        if late_session_results["淘汰原因"].astype("string").str.contains(
+        late_reasons = late_session_results.get(
+            "淘汰原因",
+            late_session_results.get(
+                "尾盘排除原因",
+                pd.Series(index=late_session_results.index, dtype="string"),
+            ),
+        )
+        if late_reasons.astype("string").str.contains(
             "尚未进入尾盘分析时段", na=False
         ).any():
             st.info("当前尚未进入14:30–15:00尾盘分析时段。")
@@ -623,22 +648,27 @@ def render_scan_results(payload: dict[str, object]) -> None:
 
     st.markdown('<div class="section-label">今日候选结果</div>', unsafe_allow_html=True)
     if final_results.empty:
-        st.info("今日暂无符合条件股票")
-        return
+        st.info("今日无达到最终评分标准的股票。")
+    else:
+        render_stock_results(final_results)
 
-    render_stock_results(final_results)
-    st.download_button(
-        "下载筛选结果 Excel",
-        data=build_excel(final_results),
-        file_name=f"尾盘筛选结果_{updated_at:%Y%m%d_%H%M%S}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        width="stretch",
-        on_click="ignore",
+    excluded_results = build_excluded_results(
+        history_results, late_session_results, scoring_results
+    )
+    missing_records = build_missing_records(
+        history_results, late_session_results, scoring_results
     )
     st.download_button(
-        "下载全部尾盘结构分析 Excel",
-        data=build_excel(late_session_results),
-        file_name=f"尾盘结构分析_{updated_at:%Y%m%d_%H%M%S}.xlsx",
+        "下载完整策略报告 Excel",
+        data=build_strategy_report(
+            final_top5=final_results,
+            initial_results=initial_results,
+            excluded_results=excluded_results,
+            missing_records=missing_records,
+            strategy_parameters=get_strategy_parameter_snapshot(),
+            updated_at=updated_at,
+        ),
+        file_name=f"A股尾盘策略报告_{updated_at:%Y%m%d_%H%M%S}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
         on_click="ignore",
@@ -680,17 +710,19 @@ def render_home() -> None:
         level, message = notice
         getattr(st, level)(message)
 
-    st.markdown(
-        '<div class="risk-banner">本工具仅用于公开数据筛选和策略研究，'
-        '不构成任何投资建议。</div>',
-        unsafe_allow_html=True,
-    )
     render_strategy_flow()
 
     if st.session_state.scan_payload is None:
         st.info("点击“开始今日扫描”运行现有策略；首页不会自动请求行情。")
     else:
         render_scan_results(st.session_state.scan_payload)
+
+    st.markdown(
+        '<div class="risk-banner">本工具仅用于公开数据筛选和策略研究，'
+        '所有观察条件、失效条件、止损或目标区间均为策略研究参考，'
+        '不构成任何投资建议。</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def main() -> None:

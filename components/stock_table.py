@@ -1,5 +1,6 @@
 """响应式股票结果组件与 Excel 导出。"""
 
+from datetime import datetime
 from html import escape
 from io import BytesIO
 
@@ -10,6 +11,7 @@ from config import MARKET_CAP_UNIT
 
 
 DISPLAY_COLUMNS = [
+    "排名",
     "代码",
     "名称",
     "最新价",
@@ -28,7 +30,6 @@ DISPLAY_COLUMNS = [
     "尾盘结构评分",
     "淘汰原因",
     "数据完整性",
-    "尾盘排除原因",
     "综合得分",
     "观察标记",
     "资金表现得分",
@@ -40,8 +41,11 @@ DISPLAY_COLUMNS = [
     "行业涨跌幅",
     "主力净流入占比",
     "缺失项",
+    "数据完整度",
+    "数据更新时间",
+    "评分依据",
     "入选原因",
-    "风险",
+    "主要风险",
     "次日观察条件",
 ]
 
@@ -54,6 +58,12 @@ def _display_data(data: pd.DataFrame) -> pd.DataFrame:
             "涨跌幅": "涨跌幅 (%)",
             "换手率": "换手率 (%)",
             "总市值": "总市值 (亿元)",
+            "综合得分": "综合评分",
+            "资金表现得分": "资金分",
+            "板块强度得分": "板块分",
+            "技术形态得分": "技术分",
+            "尾盘结构得分": "尾盘分",
+            "市场情绪得分": "市场情绪分",
         },
         inplace=True,
     )
@@ -76,12 +86,12 @@ def _format_display_value(column: str, value: object) -> str:
         "换手率 (%)",
         "量比",
         "总市值 (亿元)",
-        "综合得分",
-        "资金表现得分",
-        "板块强度得分",
-        "技术形态得分",
-        "尾盘结构得分",
-        "市场情绪得分",
+        "综合评分",
+        "资金分",
+        "板块分",
+        "技术分",
+        "尾盘分",
+        "市场情绪分",
         "行业涨跌幅",
         "主力净流入占比",
     }
@@ -89,6 +99,7 @@ def _format_display_value(column: str, value: object) -> str:
         return _format_number(value, 0)
     if column in {
         "高于VWAP占比", "尾盘最大回撤", "最后10分钟涨跌幅", "数据完整性",
+        "数据完整度",
     }:
         return f"{float(value):.1%}"
     if column in numeric_columns:
@@ -142,4 +153,82 @@ def build_excel(data: pd.DataFrame) -> bytes:
     output = BytesIO()
     export_data = _display_data(data)
     export_data.to_excel(output, index=False, engine="openpyxl", sheet_name="筛选结果")
+    return output.getvalue()
+
+
+def build_strategy_report(
+    final_top5: pd.DataFrame,
+    initial_results: pd.DataFrame,
+    excluded_results: pd.DataFrame,
+    missing_records: pd.DataFrame,
+    strategy_parameters: dict[str, object],
+    updated_at: datetime,
+) -> bytes:
+    """生成包含五个审计工作表的策略报告。"""
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    output = BytesIO()
+    top_columns = [
+        "排名", "代码", "名称", "最新价", "综合得分", "资金表现得分",
+        "板块强度得分", "技术形态得分", "尾盘结构得分", "市场情绪得分",
+        "观察标记", "入选原因", "主要风险", "次日观察条件", "数据完整度",
+        "数据更新时间", "缺失项", "评分依据",
+    ]
+    top_report = final_top5.reindex(columns=top_columns).copy()
+    top_report.rename(
+        columns={
+            "综合得分": "综合评分",
+            "资金表现得分": "资金分",
+            "板块强度得分": "板块分",
+            "技术形态得分": "技术分",
+            "尾盘结构得分": "尾盘分",
+            "市场情绪得分": "市场情绪分",
+        },
+        inplace=True,
+    )
+    parameter_frame = pd.DataFrame(
+        [{"参数": key, "当前值": value} for key, value in strategy_parameters.items()]
+    )
+    sheets = {
+        "最终Top5": top_report,
+        "全部初筛结果": initial_results.copy(),
+        "被排除股票": excluded_results.copy(),
+        "数据缺失记录": missing_records.copy(),
+        "策略参数快照": parameter_frame,
+    }
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name, frame in sheets.items():
+            export = frame.copy()
+            if export.empty and not len(export.columns):
+                export = pd.DataFrame({"说明": ["本次扫描无记录"]})
+            export = export.astype(object).where(pd.notna(export), None)
+            export.to_excel(writer, sheet_name=sheet_name, index=False, startrow=2)
+            sheet = writer.book[sheet_name]
+            column_count = max(1, len(export.columns))
+            sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=column_count)
+            sheet.cell(1, 1, f"A股尾盘策略报告 · {sheet_name}")
+            sheet.cell(1, 1).font = Font(bold=True, color="FFFFFF", size=14)
+            sheet.cell(1, 1).fill = PatternFill("solid", fgColor="102A43")
+            sheet.cell(1, 1).alignment = Alignment(horizontal="left")
+            for cell in sheet[3]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="176B87")
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            sheet.freeze_panes = "A4"
+            last_column = get_column_letter(column_count)
+            sheet.auto_filter.ref = f"A3:{last_column}{sheet.max_row}"
+            for index, column in enumerate(export.columns, start=1):
+                values = [str(column)] + [str(value) for value in export[column].dropna().head(200)]
+                width = min(42, max(10, max((len(value) for value in values), default=10) + 2))
+                sheet.column_dimensions[get_column_letter(index)].width = width
+                for cell in sheet[get_column_letter(index)][3:]:
+                    cell.alignment = Alignment(vertical="top", wrap_text=True)
+                if column in {"数据完整度", "数据完整性", "高于VWAP占比", "尾盘最大回撤"}:
+                    for cell in sheet[get_column_letter(index)][3:]:
+                        cell.number_format = "0.0%"
+            sheet.sheet_view.showGridLines = False
+            sheet.cell(sheet.max_row + 2, 1, "本报告仅用于公开数据筛选和策略研究，不构成任何投资建议。")
+            sheet.cell(sheet.max_row, 1).font = Font(color="C00000", italic=True)
+        writer.book.properties.created = updated_at.replace(tzinfo=None)
     return output.getvalue()

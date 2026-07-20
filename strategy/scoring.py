@@ -45,6 +45,7 @@ def calculate_candidate_score(
 ) -> dict[str, object]:
     """按真实数据计算五项评分，缺失部分计 0 分。"""
     missing = list(dict.fromkeys(context_missing))
+    available_points = 0.0
 
     fund_flow_points = _scaled(
         main_fund_ratio,
@@ -55,6 +56,8 @@ def calculate_candidate_score(
     if fund_flow_points is None:
         fund_flow_points = 0.0
         missing.append("主力资金净流入")
+    else:
+        available_points += SCORE_FUND_FLOW_PART
     volume_points = _scaled(
         row.get("量比"),
         SCORE_VOLUME_RATIO_MIN,
@@ -64,6 +67,8 @@ def calculate_candidate_score(
     if volume_points is None:
         volume_points = 0.0
         missing.append("量比")
+    else:
+        available_points += SCORE_VOLUME_RATIO_PART
     funds_score = fund_flow_points + volume_points
 
     sector_points = _scaled(
@@ -75,6 +80,8 @@ def calculate_candidate_score(
     if sector_points is None:
         sector_points = 0.0
         missing.append("板块行业强度")
+    else:
+        available_points += SCORE_SECTOR_MAX
 
     change_points = _scaled(
         row.get("涨跌幅"),
@@ -85,6 +92,8 @@ def calculate_candidate_score(
     if change_points is None:
         change_points = 0.0
         missing.append("涨跌幅")
+    else:
+        available_points += SCORE_TECH_CHANGE_PART
     close_position = None
     if all(pd.notna(row.get(column)) for column in ("最新价", "最高", "最低")):
         high, low = float(row["最高"]), float(row["最低"])
@@ -96,6 +105,8 @@ def calculate_candidate_score(
     if position_points is None:
         position_points = 0.0
         missing.append("日内价格位置")
+    else:
+        available_points += SCORE_TECH_CLOSE_POSITION_PART
     technical_score = change_points + position_points
 
     late_points = _scaled(
@@ -104,6 +115,8 @@ def calculate_candidate_score(
     if late_points is None:
         late_points = 0.0
         missing.append("尾盘结构")
+    else:
+        available_points += SCORE_LATE_SESSION_MAX
 
     sentiment_points = _scaled(
         market_advance_ratio, 0.0, 1.0, SCORE_MARKET_SENTIMENT_MAX
@@ -111,6 +124,8 @@ def calculate_candidate_score(
     if sentiment_points is None:
         sentiment_points = 0.0
         missing.append("市场上涨家数占比")
+    else:
+        available_points += SCORE_MARKET_SENTIMENT_MAX
 
     total = round(
         funds_score + sector_points + technical_score + late_points + sentiment_points,
@@ -120,7 +135,7 @@ def calculate_candidate_score(
         rating = "重点观察"
     elif SCORE_WATCH_MIN <= total <= SCORE_WATCH_MAX:
         rating = "观察"
-    elif total <= SCORE_CAUTION_MAX:
+    elif SCORE_MINIMUM <= total <= SCORE_CAUTION_MAX:
         rating = "谨慎观察"
     else:
         rating = "未入选"
@@ -153,6 +168,18 @@ def calculate_candidate_score(
         "策略参考：次日观察量比能否继续大于1、价格能否守住今日最低价，"
         "并关注主力净流入与所属行业强度是否延续。"
     )
+    raw_fund = "缺失" if main_fund_ratio is None else f"{main_fund_ratio:.2f}%"
+    raw_industry = "缺失" if industry_change is None else f"{industry_change:.2f}%"
+    raw_sentiment = "缺失" if market_advance_ratio is None else f"{market_advance_ratio:.1%}"
+    score_basis = (
+        f"资金{funds_score:.2f}/30（主力净流入{raw_fund}→{fund_flow_points:.2f}/20，"
+        f"量比{row.get('量比')}→{volume_points:.2f}/10）；"
+        f"板块{raw_industry}→{sector_points:.2f}/20；"
+        f"技术{technical_score:.2f}/20（涨幅{row.get('涨跌幅')}%→{change_points:.2f}/10，"
+        f"日内位置{close_position if close_position is not None else '缺失'}"
+        f"→{position_points:.2f}/10）；尾盘{row.get('尾盘结构评分')}→{late_points:.2f}/20；"
+        f"市场上涨占比{raw_sentiment}→{sentiment_points:.2f}/10"
+    )
     return {
         "资金表现得分": round(funds_score, 2),
         "板块强度得分": round(sector_points, 2),
@@ -165,7 +192,10 @@ def calculate_candidate_score(
         "行业涨跌幅": industry_change,
         "主力净流入占比": main_fund_ratio,
         "缺失项": "、".join(dict.fromkeys(missing)),
+        "数据完整度": round(available_points / 100.0, 4),
+        "评分依据": score_basis,
         "入选原因": "；".join(reasons) if reasons else "各项得分未形成突出优势",
+        "主要风险": "；".join(risks),
         "风险": "；".join(risks),
         "次日观察条件": observation,
     }
@@ -175,9 +205,11 @@ def select_top_candidates(scored: pd.DataFrame) -> pd.DataFrame:
     """仅保留 80 分以上，按降序返回最多 5 只。"""
     if scored.empty:
         return scored.copy()
-    return (
+    selected = (
         scored.loc[scored["综合得分"].ge(SCORE_MINIMUM)]
         .sort_values("综合得分", ascending=False)
         .head(SCORING_MAX_RESULTS)
         .reset_index(drop=True)
     )
+    selected.insert(0, "排名", range(1, len(selected) + 1))
+    return selected
