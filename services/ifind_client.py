@@ -14,8 +14,11 @@ import streamlit as st
 
 
 IFIND_ACCESS_TOKEN_URL = "https://quantapi.51ifind.com/api/v1/get_access_token"
+IFIND_REALTIME_QUOTATION_URL = "https://quantapi.51ifind.com/api/v1/real_time_quotation"
 IFIND_REQUEST_TIMEOUT_SECONDS = 15
 IFIND_ACCESS_TOKEN_CACHE_SECONDS = 6 * 24 * 60 * 60
+IFIND_TEST_CODES = ("600000.SH", "000001.SZ")
+IFIND_TEST_INDICATORS = ("latest", "open", "high", "low")
 
 
 class IFindConnectionError(RuntimeError):
@@ -136,3 +139,157 @@ def get_access_token() -> str:
 def test_ifind_connection() -> None:
     """仅验证能够取得 access_token，不调用任何行情接口。"""
     get_access_token()
+
+
+def _request_realtime_payload(access_token: str) -> dict[str, Any]:
+    try:
+        response = requests.post(
+            IFIND_REALTIME_QUOTATION_URL,
+            headers={
+                "Content-Type": "application/json",
+                "access_token": access_token,
+                "ifindlang": "cn",
+            },
+            json={
+                "codes": ",".join(IFIND_TEST_CODES),
+                "indicators": ",".join(IFIND_TEST_INDICATORS),
+            },
+            timeout=IFIND_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+    except requests.Timeout as error:
+        raise IFindConnectionError("实时行情请求超时，请稍后重试。") from error
+    except requests.ConnectionError as error:
+        raise IFindConnectionError("实时行情网络连接失败，请检查网络或代理设置。") from error
+    except requests.HTTPError as error:
+        status_code = error.response.status_code if error.response is not None else "未知"
+        raise IFindConnectionError(
+            f"实时行情 HTTP 请求失败（状态码 {status_code}）。"
+        ) from error
+    except requests.RequestException as error:
+        raise IFindConnectionError("实时行情 HTTP 请求失败，请稍后重试。") from error
+
+    try:
+        payload = response.json()
+    except (requests.JSONDecodeError, ValueError) as error:
+        raise IFindConnectionError("同花顺实时行情返回了无法解析的 JSON 数据。") from error
+    if not isinstance(payload, dict):
+        raise IFindConnectionError("同花顺实时行情返回的数据格式不正确。")
+
+    provider_error = _extract_provider_error(payload)
+    if provider_error is not None:
+        code, message = provider_error
+        raise IFindConnectionError(
+            f"同花顺错误码 {_sanitize_provider_message(code)}：{message}"
+        )
+    return payload
+
+
+def _value_at(value: object, index: int) -> object:
+    if isinstance(value, list):
+        return value[index] if index < len(value) else None
+    return value if index == 0 else None
+
+
+def _numeric_value(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_realtime_tables(payload: dict[str, Any]) -> list[dict[str, object]]:
+    tables = payload.get("tables")
+    if not isinstance(tables, list) or not tables:
+        raise IFindConnectionError("同花顺实时行情响应中缺少行情表格。")
+
+    parsed: dict[str, dict[str, object]] = {}
+    for item in tables:
+        if not isinstance(item, dict) or not isinstance(item.get("table"), dict):
+            continue
+        raw_codes = item.get("thscode")
+        if isinstance(raw_codes, list):
+            codes = [str(code).strip() for code in raw_codes]
+        elif isinstance(raw_codes, str):
+            codes = [code.strip() for code in raw_codes.split(",") if code.strip()]
+        else:
+            codes = []
+
+        table = item["table"]
+        row_count = max(
+            [len(codes), 1]
+            + [len(value) for value in table.values() if isinstance(value, list)]
+        )
+        for index in range(row_count):
+            code = codes[index] if index < len(codes) else ""
+            if code not in IFIND_TEST_CODES:
+                continue
+            parsed[code] = {
+                "股票代码": code,
+                "最新价": _numeric_value(_value_at(table.get("latest"), index)),
+                "开盘价": _numeric_value(_value_at(table.get("open"), index)),
+                "最高价": _numeric_value(_value_at(table.get("high"), index)),
+                "最低价": _numeric_value(_value_at(table.get("low"), index)),
+                "数据源": "同花顺iFinD",
+            }
+
+    missing_codes = [code for code in IFIND_TEST_CODES if code not in parsed]
+    if missing_codes:
+        raise IFindConnectionError("同花顺实时行情响应缺少指定股票数据。")
+    return [parsed[code] for code in IFIND_TEST_CODES]
+
+
+def fetch_test_realtime_quotes() -> list[dict[str, object]]:
+    """仅获取固定两只股票的四项基础实时行情。"""
+    access_token = get_access_token()
+    payload = _request_realtime_payload(access_token)
+    return _parse_realtime_tables(payload)
+
+
+def post_authenticated_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    operation: str,
+) -> dict[str, Any]:
+    """执行通用 iFinD HTTP 请求，仅返回已校验 JSON，不记录认证信息。"""
+    access_token = get_access_token()
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Content-Type": "application/json",
+                "access_token": access_token,
+                "ifindlang": "cn",
+            },
+            json=payload,
+            timeout=IFIND_REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+    except requests.Timeout as error:
+        raise IFindConnectionError(f"{operation}请求超时，请稍后重试。") from error
+    except requests.ConnectionError as error:
+        raise IFindConnectionError(f"{operation}网络连接失败。") from error
+    except requests.HTTPError as error:
+        status_code = error.response.status_code if error.response is not None else "未知"
+        raise IFindConnectionError(
+            f"{operation} HTTP 请求失败（状态码 {status_code}）。"
+        ) from error
+    except requests.RequestException as error:
+        raise IFindConnectionError(f"{operation} HTTP 请求失败。") from error
+
+    try:
+        result = response.json()
+    except (requests.JSONDecodeError, ValueError) as error:
+        raise IFindConnectionError(f"{operation}返回了无法解析的 JSON 数据。") from error
+    if not isinstance(result, dict):
+        raise IFindConnectionError(f"{operation}返回的数据格式不正确。")
+    provider_error = _extract_provider_error(result)
+    if provider_error is not None:
+        code, message = provider_error
+        raise IFindConnectionError(
+            f"同花顺错误码 {_sanitize_provider_message(code)}：{message}"
+        )
+    return result

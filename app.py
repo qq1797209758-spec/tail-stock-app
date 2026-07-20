@@ -13,9 +13,15 @@ import streamlit as st
 
 import config as strategy_settings
 from components.stock_table import build_strategy_report, render_stock_results
+from components.backtest_report import build_backtest_excel
 from config import (
     APP_DESCRIPTION,
     APP_TITLE,
+    BACKTEST_DEFAULT_MAX_STOCKS,
+    BACKTEST_DEFAULT_RANGE_TRADING_DAYS,
+    BACKTEST_MARKET_CLOSE_TIME,
+    BACKTEST_MAX_STOCKS_LIMIT,
+    BACKTEST_MAX_TRADING_DAYS,
     DATA_CACHE_TTL,
     EXCLUDED_NAME_KEYWORDS,
     FUND_FLOW_NET_RATIO_MAX,
@@ -64,8 +70,13 @@ from config import (
     VOLUME_RATIO_MIN,
 )
 from services.market_data import MarketDataError, fetch_a_share_spot
+from services.backtest_data import BacktestDataError, fetch_trade_calendar
 from services.history_data import HistoryDataError, analyze_recent_limit_up
-from services.ifind_client import IFindConnectionError, test_ifind_connection
+from services.ifind_client import (
+    IFindConnectionError,
+    fetch_test_realtime_quotes,
+    test_ifind_connection,
+)
 from services.late_session import (
     LateSessionDataError,
     analyze_late_session,
@@ -83,6 +94,7 @@ from services.scan_history import (
     dataframe_records,
 )
 from strategy.filters import apply_filters
+from strategy.backtest import BacktestResult, run_historical_backtest
 from strategy.reporting import build_excluded_results, build_missing_records
 from strategy.scoring import calculate_candidate_score, select_top_candidates
 from utils.logger import get_logger
@@ -1014,6 +1026,154 @@ def render_home() -> None:
         '</section>',
         unsafe_allow_html=True,
     )
+    _render_home_content(now)
+
+
+def _default_backtest_range(now: datetime) -> tuple[object, object]:
+    """默认覆盖最近20个可用于选择的完整交易日。"""
+    try:
+        calendar = fetch_trade_calendar()
+        today = pd.Timestamp(now.date())
+        close_time = clock_time.fromisoformat(BACKTEST_MARKET_CLOSE_TIME)
+        last_complete = today if now.time() >= close_time else today - pd.Timedelta(days=1)
+        completed = calendar[calendar <= last_complete]
+        eligible = completed[:-1]  # 最后一日没有已完成的下一交易日收益。
+        if len(eligible):
+            end = eligible[-1].date()
+            start = eligible[max(0, len(eligible) - BACKTEST_DEFAULT_RANGE_TRADING_DAYS)].date()
+            return start, end
+    except Exception:
+        pass
+    today = now.date()
+    return today - pd.Timedelta(days=35), today - pd.Timedelta(days=1)
+
+
+def _format_backtest_metric(key: str, value: object) -> str:
+    if value is None or pd.isna(value):
+        return "--"
+    if key in {"胜率", "最大回撤", "次日最高价高于买入价1%比例", "次日最高价高于买入价3%比例", "次日最高价高于买入价5%比例"}:
+        return f"{float(value):.1%}"
+    if "收益率" in key or key in {"累计收益率", "最大单笔盈利", "最大单笔亏损"}:
+        return f"{float(value):.2f}%"
+    return str(value)
+
+
+def render_backtest_page() -> None:
+    """历史回测标签页；不影响现有实时选股状态。"""
+    now = datetime.now(MARKET_TIMEZONE)
+    st.markdown('<div class="section-label">近10个交易日历史回测</div>', unsafe_allow_html=True)
+    st.warning("历史回测结果不代表未来表现。本模块不会使用今天实时行情倒推历史日期。")
+    st.caption(
+        "股票池、名称、涨跌幅、换手率、总股本、涨停与尾盘数据均按筛选日截断；"
+        "次日行情仅用于收益评价。历史主力资金和板块强度无法可靠复现时对应评分计0分并标记缺失。"
+    )
+    default_start, default_end = _default_backtest_range(now)
+    controls = st.columns(4)
+    start_date = controls[0].date_input("开始日期", value=default_start, key="backtest_start")
+    end_date = controls[1].date_input("结束日期", value=default_end, key="backtest_end")
+    max_stocks = controls[2].number_input(
+        "每日最多股票数量", min_value=1, max_value=BACKTEST_MAX_STOCKS_LIMIT,
+        value=BACKTEST_DEFAULT_MAX_STOCKS, step=1, key="backtest_max_stocks",
+    )
+    return_basis = controls[3].selectbox(
+        "买卖口径",
+        (
+            "A. 次日开盘买入，次日收盘卖出",
+            "B. 筛选日14:50后首条有效分钟收盘买入，次日收盘卖出",
+        ),
+        key="backtest_return_basis",
+    )
+    st.caption(
+        f"日期控件默认覆盖最近 {BACKTEST_DEFAULT_RANGE_TRADING_DAYS} 个完整交易日；"
+        f"为控制数据量，每次实际取其中最近 {BACKTEST_MAX_TRADING_DAYS} 个具备完整次日行情的交易日。"
+    )
+    if st.button("开始历史回测", type="primary", width="stretch"):
+        if start_date > end_date:
+            st.error("历史回测失败：开始日期不能晚于结束日期。")
+        else:
+            progress_bar = st.progress(0, text="准备历史回测数据……")
+
+            def update_progress(value: float, text: str) -> None:
+                progress_bar.progress(min(1.0, max(0.0, value)), text=text)
+
+            try:
+                result = run_historical_backtest(
+                    start_date,
+                    end_date,
+                    max_stocks=int(max_stocks),
+                    return_basis=return_basis,
+                    now=now,
+                    progress=update_progress,
+                    max_days=BACKTEST_MAX_TRADING_DAYS,
+                )
+                st.session_state.backtest_result = result
+                failed_days = int(result.summary.get("数据失败交易日数量", 0))
+                total_days = int(result.summary.get("回测交易日数量", 0))
+                if total_days and failed_days == total_days:
+                    st.warning("回测流程已结束，但所有交易日均因数据不可用而失败；未生成虚假结果。")
+                elif failed_days:
+                    st.warning(f"历史回测部分完成，{failed_days}个交易日数据失败，请查看缺失记录。")
+                else:
+                    st.success("历史回测完成")
+            except BacktestDataError as error:
+                st.error(f"历史回测失败：{error}")
+            except Exception as error:
+                logger.exception("历史回测发生未知错误")
+                st.error(f"历史回测失败（{type(error).__name__}），错误已记录，页面仍可使用。")
+            finally:
+                progress_bar.empty()
+
+    result = st.session_state.get("backtest_result")
+    if not isinstance(result, BacktestResult):
+        st.info("请选择日期范围并点击“开始历史回测”。")
+        return
+
+    metric_items = list(result.summary.items())
+    for start in range(0, len(metric_items), 4):
+        columns = st.columns(4)
+        for column, (key, value) in zip(columns, metric_items[start : start + 4]):
+            column.metric(key, _format_backtest_metric(key, value))
+
+    st.markdown("#### 每日收益曲线")
+    if result.daily.empty:
+        st.info("本次回测没有可展示的每日收益。")
+    else:
+        chart_data = result.daily.copy()
+        chart_data["筛选日期"] = pd.to_datetime(chart_data["筛选日期"])
+        st.line_chart(
+            chart_data.set_index("筛选日期")[["每日等权平均收益率", "累计收益率"]]
+        )
+        st.dataframe(result.daily, hide_index=True, width="stretch")
+
+    st.markdown("#### 回测明细")
+    if result.details.empty:
+        st.info("所选交易日没有满足全部可验证条件的股票，记录为空仓。")
+    else:
+        st.dataframe(result.details, hide_index=True, width="stretch")
+
+    with st.expander(f"数据失败与缺失记录（{len(result.failures)}）"):
+        if result.failures.empty:
+            st.success("本次回测没有接口失败或无法验证记录。")
+        else:
+            st.dataframe(result.failures, hide_index=True, width="stretch")
+
+    st.download_button(
+        "下载历史回测 Excel",
+        data=build_backtest_excel(result),
+        file_name=f"A股尾盘历史回测_{now:%Y%m%d_%H%M%S}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        width="stretch",
+        on_click="ignore",
+    )
+    st.markdown(
+        '<div class="risk-banner">历史回测结果不代表未来表现，'
+        '不构成任何投资建议。</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _render_home_content(now: datetime) -> None:
+    """渲染既有实时首页内容，保持回测模块与实时功能隔离。"""
     render_status_and_metrics(now)
 
     if st.session_state.current_view == "history":
@@ -1053,6 +1213,16 @@ def render_home() -> None:
             st.error(f"同花顺连接失败：{error}")
         except Exception:
             st.error("同花顺连接失败：发生未知错误，请稍后重试。")
+    if st.button("测试同花顺实时行情", width="stretch", disabled=scanning):
+        try:
+            with st.spinner("正在获取两只股票的同花顺实时行情……"):
+                ifind_quotes = fetch_test_realtime_quotes()
+            st.caption("数据源：同花顺iFinD")
+            st.dataframe(pd.DataFrame(ifind_quotes), hide_index=True, width="stretch")
+        except IFindConnectionError as error:
+            st.error(f"同花顺实时行情测试失败：{error}")
+        except Exception:
+            st.error("同花顺实时行情测试失败：发生未知错误，请稍后重试。")
     st.caption(
         "同一时刻只允许一次完整扫描，扫描期间操作按钮会锁定。"
         "当前版本不安全中断已发出的公开数据请求；需强制终止时请停止 Streamlit 进程。"
@@ -1090,7 +1260,11 @@ def main() -> None:
     apply_responsive_styles()
     render_strategy_sidebar()
     try:
-        render_home()
+        realtime_tab, backtest_tab = st.tabs(["实时选股", "历史回测"])
+        with realtime_tab:
+            render_home()
+        with backtest_tab:
+            render_backtest_page()
     except Exception as error:
         logger.exception("页面渲染失败")
         st.error(f"页面加载失败：{type(error).__name__}")
