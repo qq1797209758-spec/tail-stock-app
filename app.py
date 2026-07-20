@@ -18,6 +18,7 @@ from config import (
     FUND_FLOW_NET_RATIO_MAX,
     FUND_FLOW_NET_RATIO_MIN,
     HISTORY_CACHE_TTL,
+    HISTORY_MIN_FETCH_TRADING_DAYS,
     HISTORY_REQUEST_INTERVAL_SECONDS,
     HISTORY_TRADING_DAYS,
     INTRADAY_CACHE_TTL,
@@ -26,7 +27,8 @@ from config import (
     MARKET_CAP_MAX,
     MARKET_CAP_MIN,
     MARKET_CAP_UNIT,
-    LIMIT_UP_CHANGE_THRESHOLD,
+    LIMIT_UP_PRICE_TOLERANCE,
+    MAIN_BOARD_LIMIT_UP_RATE,
     LATE_LAST_MINUTES,
     LATE_MAX_DRAWDOWN,
     LATE_RAPID_DROP_MAX_CONSECUTIVE,
@@ -36,6 +38,7 @@ from config import (
     LATE_VWAP_ABOVE_RATIO_MIN,
     PRICE_CHANGE_MAX,
     PRICE_CHANGE_MIN,
+    PRICE_TICK_SIZE,
     SCORE_MINIMUM,
     SCORE_FUND_FLOW_PART,
     SCORE_LATE_SESSION_MAX,
@@ -129,8 +132,15 @@ def render_strategy_sidebar() -> None:
             f"{MARKET_CAP_MAX / MARKET_CAP_UNIT:g}亿元"
         )
         st.divider()
-        st.write(f"**历史范围：** 最近 {HISTORY_TRADING_DAYS} 个交易日")
-        st.write(f"**涨停容差：** 涨跌幅 ≥ {LIMIT_UP_CHANGE_THRESHOLD:g}%")
+        st.write(
+            f"**历史范围：** 至少取 {HISTORY_MIN_FETCH_TRADING_DAYS} 日，"
+            f"判断最近 {HISTORY_TRADING_DAYS} 个有效交易日"
+        )
+        st.write(
+            f"**涨停规则：** 前收盘 × {1 + MAIN_BOARD_LIMIT_UP_RATE:.2f}，"
+            f"按{PRICE_TICK_SIZE:.2f}元半入四舍五入"
+        )
+        st.write(f"**价格容差：** {LIMIT_UP_PRICE_TOLERANCE:g} 元")
         st.write(f"**请求间隔：** {HISTORY_REQUEST_INTERVAL_SECONDS:g} 秒/股")
         st.write(f"**历史缓存：** {HISTORY_CACHE_TTL // 60} 分钟")
         st.divider()
@@ -178,7 +188,10 @@ def apply_limit_up_filter(candidates):
     if candidates.empty:
         empty = candidates.copy()
         empty["涨停判断"] = pd.Series(dtype="string")
+        empty["20日内是否涨停"] = pd.Series(dtype="string")
         empty["最近涨停日期"] = pd.Series(dtype="string")
+        empty["20日涨停次数"] = pd.Series(dtype="int64")
+        empty["数据状态"] = pd.Series(dtype="string")
         return empty, empty.copy()
 
     processed_rows = []
@@ -196,14 +209,29 @@ def apply_limit_up_filter(candidates):
             result = load_limit_up_result(stock_code)
         except HistoryDataError as error:
             logger.warning("股票 %s 历史判断跳过：%s", stock_code, error)
-            result = {"涨停判断": "数据不足", "最近涨停日期": ""}
+            result = {
+                "20日内是否涨停": "无法验证",
+                "最近涨停日期": "",
+                "20日涨停次数": 0,
+                "数据状态": error.status,
+                "涨停判断": "数据不足",
+            }
         except Exception as error:
             logger.exception("股票 %s 历史判断发生未知错误", stock_code)
-            result = {"涨停判断": "数据不足", "最近涨停日期": ""}
+            result = {
+                "20日内是否涨停": "无法验证",
+                "最近涨停日期": "",
+                "20日涨停次数": 0,
+                "数据状态": "无法验证",
+                "涨停判断": "数据不足",
+            }
 
         output_row = row.copy()
-        output_row["涨停判断"] = result["涨停判断"]
-        output_row["最近涨停日期"] = result["最近涨停日期"]
+        for field in (
+            "20日内是否涨停", "最近涨停日期", "20日涨停次数",
+            "数据状态", "涨停判断",
+        ):
+            output_row[field] = result[field]
         processed_rows.append(output_row)
 
         if position < total:
@@ -455,6 +483,7 @@ def run_today_scan() -> None:
     st.session_state.highest_score = highest_score
     st.session_state.scan_payload = {
         "updated_at": updated_at,
+        "initial_filter_count": len(filter_result.final),
         "history_results": history_results,
         "limit_up_results": limit_up_results,
         "late_session_results": late_session_results,
@@ -537,13 +566,36 @@ def render_strategy_flow() -> None:
 def render_scan_results(payload: dict[str, object]) -> None:
     updated_at = payload["updated_at"]
     history_results = payload["history_results"]
+    limit_up_results = payload["limit_up_results"]
     late_session_results = payload["late_session_results"]
     scoring_results = payload["scoring_results"]
     final_results = payload["final_results"]
 
-    insufficient_count = int(history_results["涨停判断"].eq("数据不足").sum())
+    successful_history_count = int(history_results["数据状态"].eq("正常").sum())
+    insufficient_count = int(history_results["数据状态"].ne("正常").sum())
+    limit_up_count = len(limit_up_results)
+    history_stats = [
+        ("初筛数量", int(payload["initial_filter_count"])),
+        ("成功取得历史数据数量", successful_history_count),
+        ("20日内有涨停数量", limit_up_count),
+        ("数据不足数量", insufficient_count),
+    ]
+    stat_html = "".join(
+        f'<div class="metric-card"><span class="metric-label">{escape(label)}</span>'
+        f'<strong class="metric-value">{value}</strong></div>'
+        for label, value in history_stats
+    )
+    st.markdown(
+        '<div class="section-label">20日涨停筛选统计</div>'
+        f'<div class="metric-grid">{stat_html}</div>',
+        unsafe_allow_html=True,
+    )
     if insufficient_count:
-        st.warning(f"{insufficient_count} 只股票历史数据不足，未计入最终结果。")
+        st.warning(f"{insufficient_count} 只股票历史数据不足或无法验证，未计入后续结果。")
+
+    if not history_results.empty:
+        with st.expander("查看全部20日涨停判断"):
+            render_stock_results(history_results)
 
     unverifiable_count = int(
         late_session_results["尾盘结构状态"].eq("无法验证").sum()
