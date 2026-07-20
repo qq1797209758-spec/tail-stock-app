@@ -65,6 +65,7 @@ from config import (
 )
 from services.market_data import MarketDataError, fetch_a_share_spot
 from services.history_data import HistoryDataError, analyze_recent_limit_up
+from services.ifind_client import IFindConnectionError, test_ifind_connection
 from services.late_session import (
     LateSessionDataError,
     analyze_late_session,
@@ -1043,6 +1044,15 @@ def render_home() -> None:
         on_click=queue_dashboard_action, args=("history",),
         disabled=scanning,
     )
+    if st.button("测试同花顺连接", width="stretch", disabled=scanning):
+        try:
+            with st.spinner("正在测试同花顺连接……"):
+                test_ifind_connection()
+            st.success("同花顺连接成功")
+        except IFindConnectionError as error:
+            st.error(f"同花顺连接失败：{error}")
+        except Exception:
+            st.error("同花顺连接失败：发生未知错误，请稍后重试。")
     st.caption(
         "同一时刻只允许一次完整扫描，扫描期间操作按钮会锁定。"
         "当前版本不安全中断已发出的公开数据请求；需强制终止时请停止 Streamlit 进程。"
