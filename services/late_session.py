@@ -1,6 +1,7 @@
 """基于免费分钟行情的尾盘结构近似分析。"""
 
 from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import akshare as ak
 import pandas as pd
@@ -24,6 +25,9 @@ from config import (
     MINUTE_VOLUME_SHARE_MULTIPLIER,
 )
 from services.network import call_with_proxy_fallback
+
+
+SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 class LateSessionDataError(RuntimeError):
@@ -64,7 +68,14 @@ def analyze_late_session(
     now: datetime | None = None,
 ) -> dict[str, object]:
     """返回尾盘结构状态、评分、指标和排除原因。"""
-    now = now or datetime.now()
+    if now is None:
+        now = datetime.now(SHANGHAI_TIMEZONE)
+    elif now.tzinfo is not None:
+        now = now.astimezone(SHANGHAI_TIMEZONE)
+
+    # AkShare 返回的分钟时间和下方 datetime.combine() 均为无时区时间；
+    # 先换算为上海本地时间，再移除 tzinfo，避免混用时报 TypeError。
+    now = now.replace(tzinfo=None)
     late_start_time = time.fromisoformat(LATE_SESSION_START_TIME)
     session_end = datetime.combine(
         now.date(),
