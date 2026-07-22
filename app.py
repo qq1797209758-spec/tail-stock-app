@@ -13,11 +13,13 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import numpy as np
 import streamlit as st
 
 import config as strategy_settings
 from components.stock_table import build_strategy_report, render_stock_results
 from components.backtest_report import build_backtest_excel
+from components.review_pages import render_daily_review, render_historical_review
 from config import (
     APP_DESCRIPTION,
     APP_TITLE,
@@ -86,6 +88,10 @@ from services.late_session import (
     unverifiable_late_session_result,
 )
 from services.intraday import get_eastmoney_circuit_status
+from services.review_store import SQLiteReviewRepository
+from services.review_service import (
+    indicator_effectiveness, learning_status, run_pending_reviews,
+)
 from services.scoring_data import (
     ScoringDataError,
     fetch_industry_strength,
@@ -149,6 +155,20 @@ def get_deployment_commit_id() -> str:
 @st.cache_resource(show_spinner=False)
 def get_scan_history_repository() -> SQLiteScanHistoryRepository:
     return SQLiteScanHistoryRepository(BASE_DIR / SCAN_HISTORY_DATABASE)
+
+
+@st.cache_resource(show_spinner=False)
+def get_review_repository() -> SQLiteReviewRepository:
+    repository=SQLiteReviewRepository(BASE_DIR / SCAN_HISTORY_DATABASE)
+    repository.ensure_strategy(
+        strategy_settings.STRATEGY_VERSION,
+        {name:getattr(strategy_settings,name) for name in vars(strategy_settings) if name.startswith("SCORE_")},
+        {"take_profit":strategy_settings.REVIEW_TAKE_PROFIT,"stop_loss":strategy_settings.REVIEW_STOP_LOSS,
+         "commission":strategy_settings.REVIEW_COMMISSION_RATE,"stamp_duty":strategy_settings.REVIEW_STAMP_DUTY_RATE,
+         "slippage":strategy_settings.REVIEW_SLIPPAGE_RATE,"adjust":"不复权"},
+        datetime.now(MARKET_TIMEZONE).isoformat(),
+    )
+    return repository
 
 
 @st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
@@ -661,6 +681,38 @@ def _save_scan_record(
     return excluded_results, missing_records, health, all_errors
 
 
+def _finite_or_none(value: object) -> float | None:
+    numeric=pd.to_numeric(pd.Series([value]),errors="coerce").iloc[0]
+    return float(numeric) if pd.notna(numeric) and np.isfinite(numeric) else None
+
+
+def save_official_recommendations(final_results: pd.DataFrame, generated_at: datetime,
+                                  data_source: str) -> int | None:
+    """完整Top5才保存；同日同策略版本由数据库唯一键幂等upsert。"""
+    if len(final_results) != TARGET_SELECTION_COUNT:
+        return None
+    component_fields=[column for column in final_results.columns if column.endswith("得分") and column!="综合得分"]
+    records=[]
+    for position,(_,row) in enumerate(final_results.iterrows(),start=1):
+        snapshot={str(key):(None if pd.isna(value) else value) for key,value in row.items()}
+        records.append({
+            "symbol":str(row.get("代码","")).zfill(6),"name":row.get("名称"),"rank":position,
+            "sector":row.get("所属行业",row.get("所属板块")),"recommended_price":_finite_or_none(row.get("最新价")),
+            "recommendation_close":_finite_or_none(row.get("最新价")) if generated_at.time()>=clock_time(15,0) else None,
+            "total_score":_finite_or_none(row.get("综合得分")),
+            "component_scores":{field:_finite_or_none(row.get(field)) for field in component_fields},
+            "selection_type":row.get("入选类型"),"feature_snapshot":snapshot,
+            "data_completeness":_finite_or_none(row.get("数据完整度",row.get("数据完整性"))),
+            "selection_reason":row.get("入选原因"),"risk_warning":row.get("风险提示",row.get("主要风险")),
+        })
+    market_state=str(final_results.iloc[0].get("市场情绪", "未知"))
+    return get_review_repository().save_official_run(
+        recommendation_date=generated_at.date().isoformat(),generated_at=generated_at.isoformat(),
+        strategy_version=strategy_settings.STRATEGY_VERSION,market_state=market_state,
+        data_source=data_source,recommendations=records,
+    )
+
+
 def run_today_scan() -> None:
     try:
         calendar = fetch_trade_calendar()
@@ -722,6 +774,7 @@ def run_today_scan() -> None:
         scoring_results, final_results = apply_candidate_scoring(
             late_session_results, market_data, updated_at
         )
+        save_official_recommendations(final_results, datetime.now(MARKET_TIMEZONE), data_source_status)
     except MarketDataError as error:
         logger.exception("AKShare 行情连接失败")
         interface_errors.append(f"实时行情：{error}")
@@ -1408,9 +1461,15 @@ def main() -> None:
     apply_responsive_styles()
     render_strategy_sidebar()
     try:
-        realtime_tab, backtest_tab = st.tabs(["实时选股", "历史回测"])
+        realtime_tab, daily_review_tab, historical_review_tab, backtest_tab = st.tabs(
+            ["实时选股", "每日复盘", "历史复盘", "历史回测"]
+        )
         with realtime_tab:
             render_home()
+        with daily_review_tab:
+            render_daily_review(get_review_repository())
+        with historical_review_tab:
+            render_historical_review(get_review_repository())
         with backtest_tab:
             render_backtest_page()
     except Exception as error:
