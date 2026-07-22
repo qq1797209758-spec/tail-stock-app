@@ -4,6 +4,7 @@ from datetime import datetime
 from html import escape
 from io import BytesIO
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -28,6 +29,9 @@ DISPLAY_COLUMNS = [
     "连续走弱状态",
     "尾盘成交量状态",
     "尾盘结构评分",
+    "分钟数据源",
+    "分钟K线条数",
+    "接口错误原因",
     "淘汰原因",
     "数据完整性",
     "综合得分",
@@ -46,6 +50,7 @@ DISPLAY_COLUMNS = [
     "当前行情数据源",
     "入选类型",
     "数据更新时间",
+    "当前北京时间",
     "评分依据",
     "入选原因",
     "主要风险",
@@ -76,7 +81,7 @@ def _display_data(data: pd.DataFrame) -> pd.DataFrame:
 
 
 def _format_number(value: object, digits: int = 2) -> str:
-    if pd.isna(value):
+    if pd.isna(value) or not np.isfinite(float(value)):
         return "--"
     return f"{float(value):.{digits}f}"
 
@@ -107,6 +112,8 @@ def _format_display_value(column: str, value: object) -> str:
         "高于VWAP占比", "尾盘最大回撤", "最后10分钟涨跌幅", "数据完整性",
         "数据完整度",
     }:
+        if not np.isfinite(float(value)):
+            return "数据不足"
         return f"{float(value):.1%}"
     if column in numeric_columns:
         return _format_number(value)

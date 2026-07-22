@@ -89,14 +89,16 @@ def calculate_candidate_score(
     component_scores: dict[str, object] = {}
     for label, weight, score in components:
         if score is None:
-            missing.append(label)
+            if not any(str(item).startswith(label) for item in missing):
+                missing.append(label)
             component_scores[label + "得分"] = pd.NA
         else:
             raw_points += score
             available_weight += weight
             component_scores[label + "得分"] = round(score, 2)
     total = round(raw_points / available_weight * 100, 2) if available_weight else 0.0
-    completeness = available_weight / 100.0
+    market_cap_available = _number(row.get("总市值")) is not None
+    completeness = (available_weight + (10.0 if market_cap_available else 0.0)) / 110.0
 
     reasons = [
         f"{label}{score:.1f}/{weight:g}分"

@@ -136,26 +136,24 @@ def selection_masks(scored: pd.DataFrame) -> dict[str, pd.Series]:
 def stable_candidate_sort(frame: pd.DataFrame) -> pd.DataFrame:
     """实现评分、完整度、资金、VWAP、回撤及代码的确定性排序。"""
     result = frame.copy()
-    defaults = {
-        "综合得分": float("-inf"), "数据完整度": float("-inf"),
-        "主力资金净流入": float("-inf"), "主力净流入占比": float("-inf"),
-        "尾盘最大回撤": float("inf"),
-    }
-    for field, default in defaults.items():
-        if field not in result:
-            result[field] = default
-        result[field] = pd.to_numeric(result[field], errors="coerce").fillna(default)
-    result["_资金排序"] = result["主力资金净流入"].where(
-        result["主力资金净流入"].ne(float("-inf")), result["主力净流入占比"]
-    )
+    def sort_values(field: str, default: float) -> pd.Series:
+        values = result.get(field, pd.Series(pd.NA, index=result.index))
+        return pd.to_numeric(values, errors="coerce").fillna(default)
+
+    result["_得分排序"] = sort_values("综合得分", float("-inf"))
+    result["_完整度排序"] = sort_values("数据完整度", float("-inf"))
+    fund_amount = sort_values("主力资金净流入", float("-inf"))
+    fund_ratio = sort_values("主力净流入占比", float("-inf"))
+    result["_资金排序"] = fund_amount.where(fund_amount.ne(float("-inf")), fund_ratio)
+    result["_回撤排序"] = sort_values("尾盘最大回撤", float("inf"))
     result["_VWAP排序"] = result.get(
         "VWAP状态", pd.Series("", index=result.index)
     ).eq("合格").astype(int)
     return result.sort_values(
-        ["综合得分", "数据完整度", "_资金排序", "_VWAP排序", "尾盘最大回撤", "代码"],
+        ["_得分排序", "_完整度排序", "_资金排序", "_VWAP排序", "_回撤排序", "代码"],
         ascending=[False, False, False, False, True, True],
         kind="mergesort",
-    ).drop(columns=["_资金排序", "_VWAP排序"])
+    ).drop(columns=["_得分排序", "_完整度排序", "_资金排序", "_VWAP排序", "_回撤排序"])
 
 
 def select_layered_top5(scored: pd.DataFrame, target: int = TARGET_SELECTION_COUNT) -> LayeredSelectionResult:
@@ -163,6 +161,8 @@ def select_layered_top5(scored: pd.DataFrame, target: int = TARGET_SELECTION_COU
     if scored.empty:
         return LayeredSelectionResult(scored.copy(), {name: 0 for name in SELECTION_TYPES}, 0, target)
     working = scored.drop_duplicates("代码", keep="first").copy()
+    # 尾盘更新后的Top5会再次稳定排序；旧排名属于展示字段，必须先移除。
+    working.drop(columns=["排名"], errors="ignore", inplace=True)
     masks = selection_masks(working)
     funnel = {name: int(mask.sum()) for name, mask in masks.items()}
     selected_parts: list[pd.DataFrame] = []

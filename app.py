@@ -3,6 +3,8 @@
 from datetime import datetime, time as clock_time
 from html import escape
 from pathlib import Path
+import os
+import subprocess
 from threading import Lock
 import time
 from uuid import uuid4
@@ -122,6 +124,23 @@ def get_strategy_parameter_snapshot() -> dict[str, object]:
 BASE_DIR = Path(__file__).resolve().parent
 CSS_FILE = BASE_DIR / "assets" / "styles.css"
 MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
+CACHE_SCHEMA_VERSION = "2026-07-22-data-chain-v3"
+
+
+@st.cache_resource(show_spinner=False)
+def get_deployment_commit_id() -> str:
+    """优先读取云端提交环境变量，回退到当前Git工作树HEAD。"""
+    for name in ("STREAMLIT_SHARING_GITHUB_SHA", "GITHUB_SHA", "COMMIT_SHA"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value[:12]
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=BASE_DIR, text=True, timeout=5,
+        ).strip()
+    except Exception:
+        return "unknown"
 
 
 @st.cache_resource(show_spinner=False)
@@ -130,7 +149,8 @@ def get_scan_history_repository() -> SQLiteScanHistoryRepository:
 
 
 @st.cache_data(ttl=DATA_CACHE_TTL, show_spinner=False)
-def load_market_data():
+def load_market_data(cache_version: str = CACHE_SCHEMA_VERSION):
+    del cache_version
     data = fetch_a_share_spot()
     updated_at = datetime.now(ZoneInfo("Asia/Shanghai"))
     return data, updated_at
@@ -143,8 +163,11 @@ def load_limit_up_result(stock_code: str) -> dict[str, str]:
 
 
 @st.cache_data(ttl=INTRADAY_CACHE_TTL, show_spinner=False)
-def load_late_session_result(stock_code: str) -> dict[str, object]:
+def load_late_session_result(
+    stock_code: str, cache_version: str = CACHE_SCHEMA_VERSION
+) -> dict[str, object]:
     """缓存单股免费分钟行情分析结果。"""
+    del cache_version
     return analyze_late_session(stock_code)
 
 
@@ -309,6 +332,7 @@ def apply_late_session_filter(candidates):
             "尾盘结构状态", "VWAP状态", "高于VWAP占比", "尾盘最大回撤",
             "最后10分钟涨跌幅", "连续走弱状态", "尾盘成交量状态",
             "尾盘结构评分", "淘汰原因", "数据完整性", "尾盘排除原因",
+            "分钟数据源", "分钟K线条数", "接口错误原因", "当前北京时间",
         ):
             empty[field] = pd.Series(dtype="object")
         return empty, empty.copy()
@@ -390,7 +414,13 @@ def apply_candidate_scoring(candidates, market_data, updated_at):
         matched_industry, industry_change = match_industry_change(
             context.get("所属行业"), industry_strength
         )
-        missing = list(context.get("数据缺失", []))
+        missing = [
+            item if "数据源缺失" in str(item) else f"{item}（数据源缺失）"
+            for item in context.get("数据缺失", [])
+        ]
+        for field in ("换手率", "量比", "总市值"):
+            if pd.isna(row.get(field)):
+                missing.append(f"{field}（数据源缺失）")
         if not industry_source_missing and matched_industry:
             try:
                 industry_change = load_industry_five_day_strength(matched_industry)
@@ -400,7 +430,7 @@ def apply_candidate_scoring(candidates, market_data, updated_at):
         else:
             industry_change = None
         if industry_change is None:
-            missing.append("板块行业强度")
+            missing.append("所属板块近5日强度（数据源缺失）")
 
         scoring_row = row.copy()
         scoring_row["主力资金净流入"] = context.get("主力资金净流入")
@@ -466,9 +496,13 @@ def queue_dashboard_action(action: str) -> None:
 
 
 def get_market_status(now: datetime) -> tuple[str, str]:
-    """根据北京时间给出基础交易时段状态，不推断节假日。"""
-    if now.weekday() >= 5:
-        return "已收盘", "status-warn"
+    """根据北京时间和真实交易日历给出交易状态。"""
+    try:
+        if not is_trading_day(now.date(), fetch_trade_calendar()):
+            return "非交易日", "status-warn"
+    except BacktestDataError:
+        if now.weekday() >= 5:
+            return "非交易日（交易日历不可用）", "status-warn"
     current_time = now.time()
     if current_time < clock_time.fromisoformat("09:30:00"):
         return "未开盘", "status-warn"
@@ -506,9 +540,8 @@ def refresh_market_snapshot() -> None:
             st.session_state.interface_health_status = "部分降级"
             st.session_state.dashboard_notice = (
                 "warning",
-                "东方财富接口暂时不可用，已切换至 AKShare 新浪备用源。"
-                "备用源缺少量比、换手率和总市值，相关字段会标记缺失并按其余真实指标重归一化；"
-                "此类股票只会进入综合评分递补，不会被判定为严格合格。",
+                "东方财富接口暂时不可用，已切换至新浪快照并尝试用腾讯真实行情补齐"
+                "量比、换手率和总市值；仍无法补齐的字段会明确标记为数据源缺失并降低完整度。",
             )
         else:
             st.session_state.interface_health_status = "正常"
@@ -653,15 +686,26 @@ def run_today_scan() -> None:
     )
     try:
         with st.spinner("正在获取行情并执行现有策略流程，请稍候……"):
+            # 完整扫描必须使用新鲜快照和分钟线，避免云端继续复用旧字段或旧尾盘结果。
+            load_market_data.clear()
+            load_late_session_result.clear()
             market_data, updated_at = load_market_data()
             filter_result = apply_filters(market_data)
             initial_results = filter_result.initial
             enrichment_pool = build_enrichment_pool(filter_result.initial)
             source = market_data.attrs.get("data_source", "AKShare")
             data_source_status = f"正常 · {source}"
+            supplement_errors = market_data.attrs.get("supplement_errors", [])
+            if supplement_errors:
+                interface_errors.append(
+                    f"腾讯行情补齐：{len(supplement_errors)}个批次失败"
+                )
         history_results, limit_up_results = apply_limit_up_filter(enrichment_pool)
+        preliminary_scoring, preliminary_top5 = apply_candidate_scoring(
+            history_results, market_data, updated_at
+        )
         late_session_results, late_qualified = apply_late_session_filter(
-            history_results
+            preliminary_top5
         )
         scoring_results, final_results = apply_candidate_scoring(
             late_session_results, market_data, updated_at
@@ -729,9 +773,15 @@ def run_today_scan() -> None:
         "history_results": history_results, "limit_up_results": limit_up_results,
         "late_session_results": late_session_results, "late_qualified": late_qualified,
         "scoring_results": scoring_results, "final_results": final_results,
+        "preliminary_scoring_results": preliminary_scoring,
+        "preliminary_top5": preliminary_top5,
         "selection_funnel": final_results.attrs.get("funnel", {}),
         "selection_missing_count": final_results.attrs.get("missing_count", max(0, TARGET_SELECTION_COUNT - len(final_results))),
         "valid_universe_count": len(initial_results),
+        "is_trading_day": True,
+        "current_beijing_time": datetime.now(MARKET_TIMEZONE),
+        "deployment_commit_id": get_deployment_commit_id(),
+        "base_market_row_count": len(market_data),
         "excluded_results": excluded_results, "missing_records": missing_records,
     }
     if interface_errors:
@@ -901,7 +951,7 @@ def render_scan_results(payload: dict[str, object]) -> None:
             ),
         )
         if late_reasons.astype("string").str.contains(
-            "尚未进入尾盘分析时段", na=False
+            "尚未进入尾盘时段", na=False
         ).any():
             st.info("当前尚未进入14:30–15:00尾盘分析时段。")
 
@@ -909,6 +959,21 @@ def render_scan_results(payload: dict[str, object]) -> None:
         "VWAP为公开分钟成交额和成交量计算的近似均价线，"
         "不是交易所 Level-2 黄线数据。"
     )
+    diagnostic_columns = [
+        "代码", "名称", "当前行情数据源", "分钟数据源", "分钟K线条数",
+        "接口错误原因", "当前北京时间", "数据更新时间",
+    ]
+    with st.expander("行情与分钟接口诊断"):
+        st.write(f"当前部署提交ID：{payload.get('deployment_commit_id', get_deployment_commit_id())}")
+        st.write(f"当前北京时间：{payload.get('current_beijing_time', updated_at):%Y-%m-%d %H:%M:%S}")
+        st.write(f"是否为交易日：{'是' if payload.get('is_trading_day') else '否'}")
+        st.write(f"当前数据源：{st.session_state.get('data_source_status', '--')}")
+        st.write(f"基础行情总行数：{int(payload.get('base_market_row_count', 0))}")
+        available_diagnostics = [column for column in diagnostic_columns if column in final_results]
+        if available_diagnostics and not final_results.empty:
+            st.dataframe(final_results[available_diagnostics], hide_index=True, width="stretch")
+        else:
+            st.info("当前没有可展示的逐股分钟诊断记录。")
     if not late_session_results.empty:
         with st.expander("查看全部尾盘结构分析"):
             render_stock_results(late_session_results)
