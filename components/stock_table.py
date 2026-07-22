@@ -37,11 +37,14 @@ DISPLAY_COLUMNS = [
     "技术形态得分",
     "尾盘结构得分",
     "市场情绪得分",
+    "主力资金净流入",
     "所属行业",
-    "行业涨跌幅",
+    "近5日板块强度",
     "主力净流入占比",
-    "缺失项",
+    "缺失字段",
     "数据完整度",
+    "当前行情数据源",
+    "入选类型",
     "数据更新时间",
     "评分依据",
     "入选原因",
@@ -56,6 +59,7 @@ def _display_data(data: pd.DataFrame) -> pd.DataFrame:
     result.rename(
         columns={
             "涨跌幅": "涨跌幅 (%)",
+            "最新价": "当前价",
             "换手率": "换手率 (%)",
             "总市值": "总市值 (亿元)",
             "综合得分": "综合评分",
@@ -82,6 +86,7 @@ def _format_display_value(column: str, value: object) -> str:
         return "--"
     numeric_columns = {
         "最新价",
+        "当前价",
         "涨跌幅 (%)",
         "换手率 (%)",
         "量比",
@@ -92,8 +97,9 @@ def _format_display_value(column: str, value: object) -> str:
         "技术分",
         "尾盘分",
         "市场情绪分",
-        "行业涨跌幅",
+        "近5日板块强度",
         "主力净流入占比",
+        "主力资金净流入",
     }
     if column == "尾盘结构评分":
         return _format_number(value, 0)
@@ -170,10 +176,10 @@ def build_strategy_report(
 
     output = BytesIO()
     top_columns = [
-        "排名", "代码", "名称", "最新价", "综合得分", "资金表现得分",
-        "板块强度得分", "技术形态得分", "尾盘结构得分", "市场情绪得分",
-        "观察标记", "评分达标", "名单说明", "入选原因", "主要风险", "次日观察条件", "数据完整度",
-        "数据更新时间", "缺失项", "评分依据",
+        "排名", "代码", "名称", "最新价", "涨跌幅", "量比", "换手率", "总市值",
+        "主力资金净流入", "所属行业", "近5日板块强度", "VWAP状态", "尾盘最大回撤",
+        "综合得分", "入选类型", "入选原因", "风险提示", "数据完整度",
+        "当前行情数据源", "数据更新时间", "缺失字段", "评分依据",
     ]
     top_report = final_top5.reindex(columns=top_columns).copy()
     top_report.rename(
@@ -191,7 +197,7 @@ def build_strategy_report(
         [{"参数": key, "当前值": value} for key, value in strategy_parameters.items()]
     )
     sheets = {
-        "最终Top10": top_report,
+        "最终Top5": top_report,
         "全部初筛结果": initial_results.copy(),
         "被排除股票": excluded_results.copy(),
         "数据缺失记录": missing_records.copy(),

@@ -39,18 +39,22 @@ def fetch_a_share_spot() -> pd.DataFrame:
     if data.empty:
         raise MarketDataError("行情接口返回了空数据")
 
-    required_columns = {"代码", "名称", "最新价", "涨跌幅"}
+    required_columns = {"代码", "名称", "最新价", "涨跌幅", "成交量"}
     missing_columns = required_columns.difference(data.columns)
     if missing_columns:
         missing = "、".join(sorted(missing_columns))
         raise MarketDataError(f"行情数据缺少必要字段：{missing}")
 
     result = data.copy()
-    result["代码"] = result["代码"].astype("string").str.zfill(6)
+    result["代码"] = (
+        result["代码"].astype("string").str.lower()
+        .str.replace(r"^(sh|sz|bj)", "", regex=True).str.zfill(6)
+    )
     result["名称"] = result["名称"].astype("string")
 
     numeric_columns = [
-        "最新价", "涨跌幅", "换手率", "量比", "总市值", "最高", "最低"
+        "最新价", "涨跌幅", "换手率", "量比", "总市值", "最高", "最低",
+        "成交量", "成交额",
     ]
     for column in numeric_columns:
         if column not in result.columns:
@@ -60,4 +64,5 @@ def fetch_a_share_spot() -> pd.DataFrame:
 
     result.attrs["data_source"] = source
     result.attrs["is_fallback"] = "备用源" in source
+    result["当前行情数据源"] = source
     return result

@@ -1,4 +1,4 @@
-"""第一版 A 股尾盘策略筛选。"""
+"""A 股主板真实行情基础筛选。"""
 
 from dataclasses import dataclass
 import re
@@ -16,6 +16,7 @@ from config import (
     TURNOVER_RATE_MIN,
     VOLUME_RATIO_MIN,
 )
+from strategy.selection import build_valid_main_board_universe
 
 
 REQUIRED_COLUMNS = {"代码", "名称", "涨跌幅", "量比", "换手率", "总市值"}
@@ -30,7 +31,7 @@ class FilterResult:
 
 
 def apply_filters(data: pd.DataFrame) -> FilterResult:
-    """依次执行主板/名称初筛和行情数值终筛。"""
+    """返回有效主板股票池及严格快照条件候选。"""
     missing_columns = REQUIRED_COLUMNS.difference(data.columns)
     if missing_columns:
         missing = "、".join(sorted(missing_columns))
@@ -50,7 +51,8 @@ def apply_filters(data: pd.DataFrame) -> FilterResult:
         regex=True,
         na=False,
     )
-    initial = working.loc[main_board_mask & allowed_name_mask].copy()
+    del main_board_mask, allowed_name_mask, excluded_pattern, codes, names
+    initial = build_valid_main_board_universe(working)
 
     final_mask = (
         initial["涨跌幅"].between(

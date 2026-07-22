@@ -1,4 +1,4 @@
-"""可审计的 100 分候选股评分。"""
+"""可审计的 100 分候选股评分，缺失分项按可用权重重归一化。"""
 
 import pandas as pd
 
@@ -6,33 +6,41 @@ from config import (
     FUND_FLOW_NET_RATIO_MAX,
     FUND_FLOW_NET_RATIO_MIN,
     PRICE_CHANGE_MAX,
-    PRICE_CHANGE_MIN,
-    SCORE_CAUTION_MAX,
-    SCORE_FOCUS_MIN,
-    SCORE_FUND_FLOW_PART,
+    SCORE_ACTIVITY_MAX,
+    SCORE_FUNDS_MAX,
     SCORE_LATE_SESSION_MAX,
-    SCORE_MINIMUM,
-    SCORING_MAX_RESULTS,
-    SCORE_MARKET_SENTIMENT_MAX,
     SCORE_SECTOR_MAX,
-    SCORE_TECH_CHANGE_PART,
-    SCORE_TECH_CLOSE_POSITION_PART,
-    SCORE_VOLUME_RATIO_MAX,
-    SCORE_VOLUME_RATIO_MIN,
-    SCORE_VOLUME_RATIO_PART,
-    SCORE_WATCH_MAX,
-    SCORE_WATCH_MIN,
+    SCORE_TREND_MAX,
+    SCORE_TURNOVER_MAX,
+    SCORE_VOLUME_MAX,
     SECTOR_CHANGE_SCORE_MAX,
     SECTOR_CHANGE_SCORE_MIN,
 )
 
 
-def _scaled(value: object, lower: float, upper: float, points: float) -> float | None:
-    if value is None or pd.isna(value) or upper <= lower:
+def _number(value: object) -> float | None:
+    try:
+        return None if value is None or pd.isna(value) else float(value)
+    except (TypeError, ValueError):
         return None
-    numeric = float(value)
-    ratio = max(0.0, min(1.0, (numeric - lower) / (upper - lower)))
-    return ratio * points
+
+
+def _scaled(value: object, lower: float, upper: float, points: float) -> float | None:
+    numeric = _number(value)
+    if numeric is None or upper <= lower:
+        return None
+    return max(0.0, min(1.0, (numeric - lower) / (upper - lower))) * points
+
+
+def _centered(value: object, low: float, ideal: float, high: float, points: float) -> float | None:
+    numeric = _number(value)
+    if numeric is None:
+        return None
+    if numeric <= low or numeric >= high:
+        return 0.0
+    if numeric <= ideal:
+        return (numeric - low) / (ideal - low) * points
+    return (high - numeric) / (high - ideal) * points
 
 
 def calculate_candidate_score(
@@ -43,181 +51,105 @@ def calculate_candidate_score(
     market_advance_ratio: float | None,
     context_missing: list[str],
 ) -> dict[str, object]:
-    """按真实数据计算五项评分，缺失部分计 0 分。"""
+    """按七项权重评分；缺失项不扣零分，而用剩余有效权重归一到100。"""
     missing = list(dict.fromkeys(context_missing))
-    available_points = 0.0
+    components: list[tuple[str, float, float | None]] = []
 
-    fund_flow_points = _scaled(
-        main_fund_ratio,
-        FUND_FLOW_NET_RATIO_MIN,
-        FUND_FLOW_NET_RATIO_MAX,
-        SCORE_FUND_FLOW_PART,
-    )
-    if fund_flow_points is None:
-        fund_flow_points = 0.0
-        missing.append("主力资金净流入")
-    else:
-        available_points += SCORE_FUND_FLOW_PART
-    volume_points = _scaled(
-        row.get("量比"),
-        SCORE_VOLUME_RATIO_MIN,
-        SCORE_VOLUME_RATIO_MAX,
-        SCORE_VOLUME_RATIO_PART,
-    )
-    if volume_points is None:
-        volume_points = 0.0
-        missing.append("量比")
-    else:
-        available_points += SCORE_VOLUME_RATIO_PART
-    funds_score = fund_flow_points + volume_points
+    late_raw = _number(row.get("尾盘结构评分"))
+    late_score = None if late_raw is None else max(0.0, min(100.0, late_raw)) / 100 * SCORE_LATE_SESSION_MAX
+    components.append(("尾盘走势与VWAP位置", SCORE_LATE_SESSION_MAX, late_score))
 
-    sector_points = _scaled(
-        industry_change,
-        SECTOR_CHANGE_SCORE_MIN,
-        SECTOR_CHANGE_SCORE_MAX,
-        SCORE_SECTOR_MAX,
-    )
-    if sector_points is None:
-        sector_points = 0.0
-        missing.append("板块行业强度")
-    else:
-        available_points += SCORE_SECTOR_MAX
+    volume_score = _scaled(row.get("量比"), 0.8, 3.0, SCORE_VOLUME_MAX)
+    components.append(("成交量和量比", SCORE_VOLUME_MAX, volume_score))
 
-    change_points = _scaled(
-        row.get("涨跌幅"),
-        PRICE_CHANGE_MIN,
-        PRICE_CHANGE_MAX,
-        SCORE_TECH_CHANGE_PART,
-    )
-    if change_points is None:
-        change_points = 0.0
-        missing.append("涨跌幅")
-    else:
-        available_points += SCORE_TECH_CHANGE_PART
-    close_position = None
-    if all(pd.notna(row.get(column)) for column in ("最新价", "最高", "最低")):
-        high, low = float(row["最高"]), float(row["最低"])
-        if high > low:
-            close_position = (float(row["最新价"]) - low) / (high - low)
-    position_points = _scaled(
-        close_position, 0.0, 1.0, SCORE_TECH_CLOSE_POSITION_PART
-    )
-    if position_points is None:
-        position_points = 0.0
-        missing.append("日内价格位置")
-    else:
-        available_points += SCORE_TECH_CLOSE_POSITION_PART
-    technical_score = change_points + position_points
+    fund_score = _scaled(main_fund_ratio, FUND_FLOW_NET_RATIO_MIN, FUND_FLOW_NET_RATIO_MAX, SCORE_FUNDS_MAX)
+    components.append(("主力资金净流入", SCORE_FUNDS_MAX, fund_score))
 
-    late_points = _scaled(
-        row.get("尾盘结构评分"), 0.0, 100.0, SCORE_LATE_SESSION_MAX
-    )
-    if late_points is None:
-        late_points = 0.0
-        missing.append("尾盘结构")
-    else:
-        available_points += SCORE_LATE_SESSION_MAX
+    sector_score = _scaled(industry_change, SECTOR_CHANGE_SCORE_MIN, SECTOR_CHANGE_SCORE_MAX, SCORE_SECTOR_MAX)
+    components.append(("所属板块近5日强度", SCORE_SECTOR_MAX, sector_score))
 
-    sentiment_points = _scaled(
-        market_advance_ratio, 0.0, 1.0, SCORE_MARKET_SENTIMENT_MAX
-    )
-    if sentiment_points is None:
-        sentiment_points = 0.0
-        missing.append("市场上涨家数占比")
-    else:
-        available_points += SCORE_MARKET_SENTIMENT_MAX
+    change_score = _centered(row.get("涨跌幅"), 0.0, 5.5, 10.0, SCORE_TREND_MAX * 0.6)
+    position = None
+    latest, high, low = (_number(row.get(name)) for name in ("最新价", "最高", "最低"))
+    if latest is not None and high is not None and low is not None and high > low:
+        position = (latest - low) / (high - low)
+    position_score = _scaled(position, 0.0, 1.0, SCORE_TREND_MAX * 0.4)
+    trend_score = None if change_score is None and position_score is None else (change_score or 0.0) + (position_score or 0.0)
+    components.append(("当日趋势和涨幅位置", SCORE_TREND_MAX, trend_score))
 
-    total = round(
-        funds_score + sector_points + technical_score + late_points + sentiment_points,
-        2,
-    )
-    if total >= SCORE_FOCUS_MIN:
-        rating = "重点观察"
-    elif SCORE_WATCH_MIN <= total <= SCORE_WATCH_MAX:
-        rating = "观察"
-    elif SCORE_MINIMUM <= total <= SCORE_CAUTION_MAX:
-        rating = "谨慎观察"
-    else:
-        rating = "未入选"
+    turnover_score = _centered(row.get("换手率"), 0.0, 7.5, 15.0, SCORE_TURNOVER_MAX)
+    components.append(("换手率合理程度", SCORE_TURNOVER_MAX, turnover_score))
 
-    reasons = []
-    if funds_score >= 21:
-        reasons.append("资金表现较强")
-    if sector_points >= 14:
-        reasons.append("所属板块强度较高")
-    if technical_score >= 14:
-        reasons.append("日内技术形态较强")
-    if late_points >= 14:
-        reasons.append("尾盘结构通过近似验证")
-    if sentiment_points >= 7:
-        reasons.append("市场上涨情绪较强")
+    limit_count = _number(row.get("20日涨停次数"))
+    activity_score = None if limit_count is None else min(1.0, max(0.0, limit_count) / 2.0) * SCORE_ACTIVITY_MAX
+    components.append(("最近20日涨停和活跃度", SCORE_ACTIVITY_MAX, activity_score))
 
-    risks = []
+    raw_points = 0.0
+    available_weight = 0.0
+    component_scores: dict[str, object] = {}
+    for label, weight, score in components:
+        if score is None:
+            missing.append(label)
+            component_scores[label + "得分"] = pd.NA
+        else:
+            raw_points += score
+            available_weight += weight
+            component_scores[label + "得分"] = round(score, 2)
+    total = round(raw_points / available_weight * 100, 2) if available_weight else 0.0
+    completeness = available_weight / 100.0
+
+    reasons = [
+        f"{label}{score:.1f}/{weight:g}分"
+        for label, weight, score in components if score is not None and score >= weight * 0.65
+    ]
+    risks: list[str] = []
     if missing:
-        risks.append("缺失数据已扣分：" + "、".join(dict.fromkeys(missing)))
+        risks.append("以下指标缺失，得分已按可用权重重归一化：" + "、".join(dict.fromkeys(missing)))
     if main_fund_ratio is not None and main_fund_ratio < 0:
         risks.append("主力资金净流入占比为负")
-    if industry_change is not None and industry_change < 0:
-        risks.append("所属行业当日走弱")
-    if float(row.get("尾盘回撤", 0) or 0) >= 0.005:
-        risks.append("尾盘已出现一定回撤")
+    drawdown = _number(row.get("尾盘最大回撤"))
+    if drawdown is not None and drawdown >= 0.005:
+        risks.append("尾盘存在一定回撤")
+    if market_advance_ratio is None:
+        missing.append("市场情绪")
+        risks.append("市场上涨家数占比缺失")
+    elif market_advance_ratio < 0.4:
+        risks.append(f"市场情绪偏弱（上涨家数占比{market_advance_ratio:.1%}）")
     if not risks:
-        risks.append("仍存在次日低开及行情反转风险")
+        risks.append("模型仅表示相对更可能上涨，仍存在低开和行情反转风险")
 
-    observation = (
-        "策略参考：次日观察量比能否继续大于1、价格能否守住今日最低价，"
-        "并关注主力净流入与所属行业强度是否延续。"
-    )
-    raw_fund = "缺失" if main_fund_ratio is None else f"{main_fund_ratio:.2f}%"
-    raw_industry = "缺失" if industry_change is None else f"{industry_change:.2f}%"
-    raw_sentiment = "缺失" if market_advance_ratio is None else f"{market_advance_ratio:.1%}"
-    score_basis = (
-        f"资金{funds_score:.2f}/30（主力净流入{raw_fund}→{fund_flow_points:.2f}/20，"
-        f"量比{row.get('量比')}→{volume_points:.2f}/10）；"
-        f"板块{raw_industry}→{sector_points:.2f}/20；"
-        f"技术{technical_score:.2f}/20（涨幅{row.get('涨跌幅')}%→{change_points:.2f}/10，"
-        f"日内位置{close_position if close_position is not None else '缺失'}"
-        f"→{position_points:.2f}/10）；尾盘{row.get('尾盘结构评分')}→{late_points:.2f}/20；"
-        f"市场上涨占比{raw_sentiment}→{sentiment_points:.2f}/10"
-    )
-    return {
-        "资金表现得分": round(funds_score, 2),
-        "板块强度得分": round(sector_points, 2),
-        "技术形态得分": round(technical_score, 2),
-        "尾盘结构得分": round(late_points, 2),
-        "市场情绪得分": round(sentiment_points, 2),
+    result = {
+        **component_scores,
+        "尾盘结构得分": component_scores["尾盘走势与VWAP位置得分"],
+        "资金表现得分": component_scores["主力资金净流入得分"],
+        "板块强度得分": component_scores["所属板块近5日强度得分"],
+        "技术形态得分": component_scores["当日趋势和涨幅位置得分"],
         "综合得分": total,
-        "观察标记": rating,
-        "所属行业": industry_name or "",
+        "观察标记": "相对高概率候选" if total >= 70 else "综合评分递补候选",
+        "所属行业": industry_name or row.get("所属行业", ""),
+        "近5日板块强度": industry_change,
+        "市场情绪": market_advance_ratio,
         "行业涨跌幅": industry_change,
         "主力净流入占比": main_fund_ratio,
+        "主力资金净流入": row.get("主力资金净流入", pd.NA),
+        "缺失字段": "、".join(dict.fromkeys(missing)),
         "缺失项": "、".join(dict.fromkeys(missing)),
-        "数据完整度": round(available_points / 100.0, 4),
-        "评分依据": score_basis,
-        "入选原因": "；".join(reasons) if reasons else "各项得分未形成突出优势",
+        "数据完整度": round(completeness, 4),
+        "评分依据": "；".join(
+            f"{label}:{'缺失' if score is None else f'{score:.2f}/{weight:g}'}"
+            for label, weight, score in components
+        ) + f"；按可用权重{available_weight:g}/100重归一化",
+        "入选原因": "；".join(reasons) if reasons else "可用指标综合评分相对靠前",
         "主要风险": "；".join(risks),
+        "风险提示": "；".join(risks),
         "风险": "；".join(risks),
-        "次日观察条件": observation,
+        "次日观察条件": "关注量能、资金流向、板块强度及VWAP支撑是否延续。",
     }
+    return result
 
 
 def select_top_candidates(scored: pd.DataFrame) -> pd.DataFrame:
-    """按综合得分返回最多10只真实候选，未达80分者明确标记为研究递补。"""
-    if scored.empty:
-        return scored.copy()
-    selected = (
-        scored.sort_values("综合得分", ascending=False)
-        .head(SCORING_MAX_RESULTS)
-        .reset_index(drop=True)
-    )
-    below_threshold = selected["综合得分"].lt(SCORE_MINIMUM)
-    selected.loc[below_threshold, "观察标记"] = "未达80分，仅供研究"
-    selected["评分达标"] = selected["综合得分"].ge(SCORE_MINIMUM).map(
-        {True: "是", False: "否"}
-    )
-    selected["名单说明"] = "达到评分门槛"
-    selected.loc[below_threshold, "名单说明"] = (
-        "真实候选不足10只时按综合得分递补；未达80分，仅供策略研究"
-    )
-    selected.insert(0, "排名", range(1, len(selected) + 1))
-    return selected
+    """兼容旧调用；正式分层选择由 strategy.selection 完成。"""
+    from strategy.selection import select_layered_top5
+
+    return select_layered_top5(scored).selected

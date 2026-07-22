@@ -1,5 +1,8 @@
 """100 分评分所需的免费公开数据。"""
 
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import akshare as ak
 import pandas as pd
 
@@ -35,6 +38,7 @@ def fetch_stock_scoring_context(stock_code: str) -> dict[str, object]:
     context: dict[str, object] = {
         "所属行业": None,
         "主力净流入占比": None,
+        "主力资金净流入": None,
         "数据缺失": [],
     }
 
@@ -54,6 +58,7 @@ def fetch_stock_scoring_context(stock_code: str) -> dict[str, object]:
         context["数据缺失"].append("所属行业")
 
     market = "sh" if code.startswith("6") else "sz"
+    fund_flow = None
     try:
         fund_flow = call_with_proxy_fallback(
             lambda: ak.stock_individual_fund_flow(stock=code, market=market)
@@ -75,7 +80,38 @@ def fetch_stock_scoring_context(stock_code: str) -> dict[str, object]:
     except Exception:
         context["数据缺失"].append("主力资金净流入")
 
+    if isinstance(fund_flow, pd.DataFrame) and not fund_flow.empty and "主力净流入-净额" in fund_flow:
+        amounts = pd.to_numeric(fund_flow["主力净流入-净额"], errors="coerce").dropna()
+        if not amounts.empty:
+            context["主力资金净流入"] = float(amounts.iloc[-1])
+    if context["主力资金净流入"] is None:
+        context["数据缺失"].append("主力资金净流入净额")
+
     return context
+
+
+def fetch_industry_five_day_strength(industry_name: str) -> float:
+    """用真实行业日线计算最近5个有效交易日收盘变化百分比。"""
+    end = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    start = end - timedelta(days=20)
+    try:
+        data = call_with_proxy_fallback(
+            lambda: ak.stock_board_industry_hist_em(
+                symbol=str(industry_name),
+                start_date=start.strftime("%Y%m%d"),
+                end_date=end.strftime("%Y%m%d"),
+                period="日k",
+                adjust="",
+            )
+        )
+    except Exception as error:
+        raise ScoringDataError(f"行业近5日数据请求失败（{type(error).__name__}）") from error
+    if not isinstance(data, pd.DataFrame) or data.empty or "收盘" not in data:
+        raise ScoringDataError("行业近5日数据格式不完整")
+    closes = pd.to_numeric(data["收盘"], errors="coerce").dropna().tail(5)
+    if len(closes) < 2 or float(closes.iloc[0]) <= 0:
+        raise ScoringDataError("行业近5日有效交易数据不足")
+    return float((closes.iloc[-1] / closes.iloc[0] - 1) * 100)
 
 
 def match_industry_change(

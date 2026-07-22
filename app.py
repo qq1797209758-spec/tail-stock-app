@@ -50,15 +50,13 @@ from config import (
     PRICE_CHANGE_MIN,
     PRICE_TICK_SIZE,
     SCORE_MINIMUM,
-    SCORE_FUND_FLOW_PART,
+    SCORE_ACTIVITY_MAX,
+    SCORE_FUNDS_MAX,
     SCORE_LATE_SESSION_MAX,
-    SCORE_MARKET_SENTIMENT_MAX,
     SCORE_SECTOR_MAX,
-    SCORE_TECH_CHANGE_PART,
-    SCORE_TECH_CLOSE_POSITION_PART,
-    SCORE_VOLUME_RATIO_MAX,
-    SCORE_VOLUME_RATIO_MIN,
-    SCORE_VOLUME_RATIO_PART,
+    SCORE_TREND_MAX,
+    SCORE_TURNOVER_MAX,
+    SCORE_VOLUME_MAX,
     SCORING_CACHE_TTL,
     SCORING_MAX_RESULTS,
     SCORING_REQUEST_INTERVAL_SECONDS,
@@ -67,6 +65,7 @@ from config import (
     SECTOR_CHANGE_SCORE_MIN,
     TURNOVER_RATE_MAX,
     TURNOVER_RATE_MIN,
+    TARGET_SELECTION_COUNT,
     VOLUME_RATIO_MIN,
 )
 from services.market_data import MarketDataError, fetch_a_share_spot
@@ -85,6 +84,7 @@ from services.late_session import (
 from services.scoring_data import (
     ScoringDataError,
     fetch_industry_strength,
+    fetch_industry_five_day_strength,
     fetch_stock_scoring_context,
     match_industry_change,
 )
@@ -93,10 +93,12 @@ from services.scan_history import (
     SQLiteScanHistoryRepository,
     dataframe_records,
 )
+from services.trading_session import is_trading_day
 from strategy.filters import apply_filters
 from strategy.backtest import BacktestResult, run_historical_backtest
 from strategy.reporting import build_excluded_results, build_missing_records
-from strategy.scoring import calculate_candidate_score, select_top_candidates
+from strategy.scoring import calculate_candidate_score
+from strategy.selection import build_enrichment_pool, select_layered_top5
 from utils.logger import get_logger
 
 
@@ -156,6 +158,11 @@ def load_stock_scoring_context(stock_code: str) -> dict[str, object]:
     return fetch_stock_scoring_context(stock_code)
 
 
+@st.cache_data(ttl=SCORING_CACHE_TTL, show_spinner=False)
+def load_industry_five_day_strength(industry_name: str) -> float:
+    return fetch_industry_five_day_strength(industry_name)
+
+
 def apply_responsive_styles() -> None:
     """从单一文件加载全站样式。"""
     try:
@@ -204,33 +211,30 @@ def render_strategy_sidebar() -> None:
         st.write(f"**数据完整性：** ≥ {LATE_DATA_COMPLETENESS_MIN:.0%}")
         st.write(f"**量能放大：** 尾盘/14:30前30分钟均量 ≥ {LATE_VOLUME_EXPANSION_RATIO:g} 倍")
         st.divider()
-        st.write("**综合评分：** 资金30 + 板块20 + 技术20 + 尾盘20 + 情绪10")
-        st.write(f"**评分达标线：** ≥ {SCORE_MINIMUM:g} 分")
-        st.write(f"**每日研究名单：** 目标 {SCORING_MAX_RESULTS} 只")
-        st.caption("不足10只达标股票时，按真实综合评分递补并明确标记未达标；不生成虚假股票。")
-        st.caption("评分数据缺失时，对应分项计0分并在结果中说明。")
+        st.write(
+            f"**综合评分：** 尾盘{SCORE_LATE_SESSION_MAX:g} + 量能{SCORE_VOLUME_MAX:g} + "
+            f"资金{SCORE_FUNDS_MAX:g} + 板块{SCORE_SECTOR_MAX:g} + 趋势{SCORE_TREND_MAX:g} + "
+            f"换手{SCORE_TURNOVER_MAX:g} + 活跃度{SCORE_ACTIVITY_MAX:g}"
+        )
+        st.write(f"**每日研究名单：** 固定目标 {TARGET_SELECTION_COUNT} 只")
+        st.caption("严格候选不足时按四级真实行情候选递补；有效股票不足5只则明确报告缺口。")
+        st.caption("评分字段缺失时，使用其余有效指标按可用权重重新归一化。")
         with st.expander("查看评分计算依据"):
             st.write(
-                f"**资金表现 30分：** 主力净流入占比从 {FUND_FLOW_NET_RATIO_MIN:g}% "
-                f"到 {FUND_FLOW_NET_RATIO_MAX:g}% 线性计 0～{SCORE_FUND_FLOW_PART:g}分；"
-                f"量比从 {SCORE_VOLUME_RATIO_MIN:g} 到 {SCORE_VOLUME_RATIO_MAX:g} "
-                f"线性计 0～{SCORE_VOLUME_RATIO_PART:g}分。"
+                f"**资金 15分：** 主力净流入占比从 {FUND_FLOW_NET_RATIO_MIN:g}% "
+                f"到 {FUND_FLOW_NET_RATIO_MAX:g}% 线性计分；成交量和量比另计15分。"
             )
             st.write(
-                f"**板块强度 20分：** 所属行业涨跌幅从 {SECTOR_CHANGE_SCORE_MIN:g}% "
-                f"到 {SECTOR_CHANGE_SCORE_MAX:g}% 线性计 0～{SCORE_SECTOR_MAX:g}分。"
+                f"**板块强度 15分：** 近5日强度从 {SECTOR_CHANGE_SCORE_MIN:g}% "
+                f"到 {SECTOR_CHANGE_SCORE_MAX:g}% 线性计分。"
             )
             st.write(
-                f"**技术形态 20分：** 当前涨跌幅计 0～{SCORE_TECH_CHANGE_PART:g}分；"
-                f"最新价在当日最高/最低区间的位置计 0～{SCORE_TECH_CLOSE_POSITION_PART:g}分。"
+                "**趋势15分 + 换手10分 + 活跃度10分：** 结合涨幅位置、日内价格位置、"
+                "换手率合理程度和最近20日涨停次数。"
             )
             st.write(
                 f"**尾盘结构 20分：** 免费分钟行情尾盘结构评分按比例折算至"
                 f" {SCORE_LATE_SESSION_MAX:g}分。"
-            )
-            st.write(
-                f"**市场情绪 10分：** 全市场上涨股票占比按比例折算至"
-                f" {SCORE_MARKET_SENTIMENT_MAX:g}分。"
             )
 
 
@@ -346,7 +350,7 @@ def apply_late_session_filter(candidates):
 
 
 def apply_candidate_scoring(candidates, market_data, updated_at):
-    """对尾盘结构合格股票进行可审计评分并返回 Top 5。"""
+    """对真实候选池评分并执行分层 Top 5 选择。"""
     if candidates.empty:
         empty = candidates.copy()
         empty["综合得分"] = pd.Series(dtype="float64")
@@ -387,18 +391,28 @@ def apply_candidate_scoring(candidates, market_data, updated_at):
             context.get("所属行业"), industry_strength
         )
         missing = list(context.get("数据缺失", []))
-        if industry_source_missing or industry_change is None:
+        if not industry_source_missing and matched_industry:
+            try:
+                industry_change = load_industry_five_day_strength(matched_industry)
+            except ScoringDataError as error:
+                logger.warning("行业 %s 近5日强度不可用：%s", matched_industry, error)
+                industry_change = None
+        else:
+            industry_change = None
+        if industry_change is None:
             missing.append("板块行业强度")
 
+        scoring_row = row.copy()
+        scoring_row["主力资金净流入"] = context.get("主力资金净流入")
         score = calculate_candidate_score(
-            row=row,
+            row=scoring_row,
             main_fund_ratio=context.get("主力净流入占比"),
             industry_name=matched_industry,
             industry_change=industry_change,
             market_advance_ratio=market_advance_ratio,
             context_missing=missing,
         )
-        output_row = row.copy()
+        output_row = scoring_row.copy()
         for key, value in score.items():
             output_row[key] = value
         scored_rows.append(output_row)
@@ -408,10 +422,14 @@ def apply_candidate_scoring(candidates, market_data, updated_at):
 
     progress.empty()
     scored = pd.DataFrame(scored_rows).sort_values(
-        "综合得分", ascending=False
+        ["综合得分", "代码"], ascending=[False, True], kind="mergesort"
     ).reset_index(drop=True)
     scored["数据更新时间"] = updated_at.strftime("%Y-%m-%d %H:%M:%S")
-    selected = select_top_candidates(scored)
+    selection = select_layered_top5(scored)
+    selected = selection.selected
+    selected.attrs["funnel"] = selection.funnel
+    selected.attrs["missing_count"] = selection.missing_count
+    selected.attrs["valid_universe_count"] = selection.valid_universe_count
     return scored, selected.reset_index(drop=True)
 
 
@@ -489,7 +507,8 @@ def refresh_market_snapshot() -> None:
             st.session_state.dashboard_notice = (
                 "warning",
                 "东方财富接口暂时不可用，已切换至 AKShare 新浪备用源。"
-                "备用源缺少量比、换手率和总市值，可查看行情，但不会将数据不足的股票判定为策略合格。",
+                "备用源缺少量比、换手率和总市值，相关字段会标记缺失并按其余真实指标重归一化；"
+                "此类股票只会进入综合评分递补，不会被判定为严格合格。",
             )
         else:
             st.session_state.interface_health_status = "正常"
@@ -597,6 +616,17 @@ def _save_scan_record(
 
 
 def run_today_scan() -> None:
+    try:
+        calendar = fetch_trade_calendar()
+        shanghai_today = datetime.now(MARKET_TIMEZONE).date()
+        if not is_trading_day(shanghai_today, calendar):
+            st.session_state.dashboard_notice = (
+                "info", f"{shanghai_today:%Y-%m-%d} 不是A股交易日，不生成当日选股名单。"
+            )
+            return
+    except BacktestDataError as error:
+        logger.warning("交易日历不可用，继续按实时行情扫描：%s", error)
+
     if st.session_state.get("scan_in_progress") or not _SCAN_LOCK.acquire(blocking=False):
         st.session_state.dashboard_notice = (
             "warning", "已有一次完整扫描正在运行，本次重复请求已忽略。"
@@ -625,15 +655,16 @@ def run_today_scan() -> None:
         with st.spinner("正在获取行情并执行现有策略流程，请稍候……"):
             market_data, updated_at = load_market_data()
             filter_result = apply_filters(market_data)
-            initial_results = filter_result.final
+            initial_results = filter_result.initial
+            enrichment_pool = build_enrichment_pool(filter_result.initial)
             source = market_data.attrs.get("data_source", "AKShare")
             data_source_status = f"正常 · {source}"
-        history_results, limit_up_results = apply_limit_up_filter(filter_result.final)
+        history_results, limit_up_results = apply_limit_up_filter(enrichment_pool)
         late_session_results, late_qualified = apply_late_session_filter(
-            limit_up_results
+            history_results
         )
         scoring_results, final_results = apply_candidate_scoring(
-            late_qualified, market_data, updated_at
+            late_session_results, market_data, updated_at
         )
     except MarketDataError as error:
         logger.exception("AKShare 行情连接失败")
@@ -698,6 +729,9 @@ def run_today_scan() -> None:
         "history_results": history_results, "limit_up_results": limit_up_results,
         "late_session_results": late_session_results, "late_qualified": late_qualified,
         "scoring_results": scoring_results, "final_results": final_results,
+        "selection_funnel": final_results.attrs.get("funnel", {}),
+        "selection_missing_count": final_results.attrs.get("missing_count", max(0, TARGET_SELECTION_COUNT - len(final_results))),
+        "valid_universe_count": len(initial_results),
         "excluded_results": excluded_results, "missing_records": missing_records,
     }
     if interface_errors:
@@ -790,6 +824,28 @@ def render_scan_results(payload: dict[str, object]) -> None:
     scoring_results = payload["scoring_results"]
     final_results = payload["final_results"]
 
+    funnel = payload.get("selection_funnel", {})
+    if funnel:
+        funnel_items = [
+            ("有效主板股票", int(payload.get("valid_universe_count", 0))),
+            ("严格层", int(funnel.get("严格入选", 0))),
+            ("一级递补层", int(funnel.get("一级递补", 0))),
+            ("二级递补层", int(funnel.get("二级递补", 0))),
+            ("三级递补层", int(funnel.get("三级递补", 0))),
+            ("综合评分池", int(funnel.get("综合评分递补", 0))),
+            ("最终输出", len(final_results)),
+        ]
+        funnel_html = "".join(
+            f'<div class="metric-card"><span class="metric-label">{escape(label)}</span>'
+            f'<strong class="metric-value">{count}</strong></div>'
+            for label, count in funnel_items
+        )
+        st.markdown(
+            '<div class="section-label">分层筛选漏斗</div>'
+            f'<div class="metric-grid">{funnel_html}</div>',
+            unsafe_allow_html=True,
+        )
+
     scan_id = str(payload.get("scan_id", ""))
     scan_duration = payload.get("scan_duration")
     metadata = f"数据更新：{updated_at:%Y-%m-%d %H:%M:%S}"
@@ -861,21 +917,20 @@ def render_scan_results(payload: dict[str, object]) -> None:
             render_stock_results(scoring_results)
 
     st.markdown('<div class="section-label">今日候选结果</div>', unsafe_allow_html=True)
+    missing_count = int(payload.get("selection_missing_count", max(0, TARGET_SELECTION_COUNT - len(final_results))))
     if final_results.empty:
-        st.info("今日没有通过前序数据验证的真实股票，无法生成研究名单。")
+        st.error(f"真实行情接口未能提供有效候选，目标5只，当前缺少 {missing_count} 只。")
     else:
-        qualified_count = int(final_results["综合得分"].ge(SCORE_MINIMUM).sum())
-        supplemental_count = len(final_results) - qualified_count
-        if len(final_results) < SCORING_MAX_RESULTS:
-            st.warning(
-                f"通过前序验证的真实股票仅 {len(final_results)} 只，"
-                f"不足 {SCORING_MAX_RESULTS} 只，未使用虚假数据补足。"
+        if missing_count:
+            st.error(
+                f"行情接口仅提供 {len(final_results)} 只有效真实候选，"
+                f"距离固定目标5只仍缺 {missing_count} 只；系统未伪造或随机补足。"
             )
+        else:
+            st.success("已从真实行情中按分层规则稳定选出5只相对高概率候选。")
+        supplemental_count = int(final_results.get("入选类型", pd.Series(dtype="string")).ne("严格入选").sum())
         if supplemental_count:
-            st.warning(
-                f"名单中有 {supplemental_count} 只综合评分低于 {SCORE_MINIMUM:g} 分，"
-                "属于按得分排序的研究递补，不代表达到策略评分标准。"
-            )
+            st.info(f"其中 {supplemental_count} 只来自分层递补，入选类型已逐只标注。")
         render_stock_results(final_results)
 
     excluded_results = build_excluded_results(
@@ -949,7 +1004,7 @@ def render_history_page() -> None:
             metric_columns[0].metric("初筛数量", counts.get("initial", 0))
             metric_columns[1].metric("20日涨停", counts.get("limit_up", 0))
             metric_columns[2].metric("尾盘合格", counts.get("late_qualified", 0))
-            metric_columns[3].metric("最终Top10", counts.get("final", 0))
+            metric_columns[3].metric("最终Top5", counts.get("final", 0))
             st.caption(
                 f"scan_id: {record['scan_id']} · 状态：{record['status']} · "
                 f"耗时：{record['duration_seconds']:.1f}秒 · "
@@ -963,7 +1018,7 @@ def render_history_page() -> None:
                     st.success("本次扫描未记录接口错误。")
 
             top10 = pd.DataFrame(record["final_top5"])
-            st.markdown("#### 当次最终Top10研究名单")
+            st.markdown("#### 当次最终Top5研究名单")
             if top10.empty:
                 st.info("当次扫描没有通过前序数据验证的真实股票。")
             else:
