@@ -26,6 +26,7 @@ from config import (
     LATE_VWAP_ABOVE_RATIO_MIN,
 )
 from services.network import call_with_proxy_fallback
+from services.intraday import IntradayDataError, get_intraday_minutes
 
 
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -83,7 +84,7 @@ def _market_symbol(stock_code: str) -> str:
     raise LateSessionDataError("股票代码或市场参数错误：仅支持00/60沪深主板代码")
 
 
-def _fetch_minute_data(
+def _fetch_minute_data_legacy(
     stock_code: str, query_start: datetime, query_end: datetime
 ) -> tuple[pd.DataFrame, str, list[str]]:
     """优先东方财富，失败或空数据后使用新浪真实1分钟行情。"""
@@ -169,6 +170,23 @@ def _fetch_minute_data(
             request_parameters, type(error).__name__, error,
         )
     raise LateSessionDataError("；".join(errors))
+
+
+def _fetch_minute_data(
+    stock_code: str, query_start: datetime, query_end: datetime
+) -> tuple[pd.DataFrame, str, list[str]]:
+    """通过统一数据源链获取行情，并转换为分析模块的既有字段。"""
+    try:
+        unified = get_intraday_minutes(stock_code, query_start.date())
+    except IntradayDataError as error:
+        raise LateSessionDataError(str(error)) from error
+    data = unified.rename(columns={
+        "datetime": "时间", "close": "收盘", "high": "最高",
+        "volume": "成交量", "amount": "成交额",
+    }).copy()
+    data["时间"] = pd.to_datetime(data["时间"], errors="coerce")
+    data = data.loc[data["时间"].between(query_start, query_end, inclusive="both")]
+    return data, str(unified.attrs.get("source", "未知")), list(unified.attrs.get("errors", []))
 
 
 def analyze_late_session(

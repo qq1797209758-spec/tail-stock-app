@@ -4,6 +4,8 @@ from datetime import datetime, time as clock_time
 from html import escape
 from pathlib import Path
 import os
+import platform
+import random
 import subprocess
 from threading import Lock
 import time
@@ -83,6 +85,7 @@ from services.late_session import (
     analyze_late_session,
     unverifiable_late_session_result,
 )
+from services.intraday import get_eastmoney_circuit_status
 from services.scoring_data import (
     ScoringDataError,
     fetch_industry_strength,
@@ -168,7 +171,10 @@ def load_late_session_result(
 ) -> dict[str, object]:
     """缓存单股免费分钟行情分析结果。"""
     del cache_version
-    return analyze_late_session(stock_code)
+    result = analyze_late_session(stock_code)
+    result["缓存生成时间"] = datetime.now(MARKET_TIMEZONE).isoformat(timespec="seconds")
+    result["请求次数"] = get_eastmoney_circuit_status()["request_count"]
+    return result
 
 
 @st.cache_data(ttl=SCORING_CACHE_TTL, show_spinner=False)
@@ -333,6 +339,7 @@ def apply_late_session_filter(candidates):
             "最后10分钟涨跌幅", "连续走弱状态", "尾盘成交量状态",
             "尾盘结构评分", "淘汰原因", "数据完整性", "尾盘排除原因",
             "分钟数据源", "分钟K线条数", "接口错误原因", "当前北京时间",
+            "缓存命中状态", "缓存生成时间", "请求次数",
         ):
             empty[field] = pd.Series(dtype="object")
         return empty, empty.copy()
@@ -350,6 +357,12 @@ def apply_late_session_filter(candidates):
         )
         try:
             result = load_late_session_result(stock_code)
+            generated = pd.to_datetime(result.get("缓存生成时间"), errors="coerce")
+            result["缓存命中状态"] = (
+                "命中" if pd.notna(generated) and
+                (pd.Timestamp.now(tz=MARKET_TIMEZONE) - generated).total_seconds() > 2
+                else "新请求"
+            )
         except LateSessionDataError as error:
             logger.warning("股票 %s 尾盘结构无法验证：%s", stock_code, error)
             result = unverifiable_late_session_result(str(error))
@@ -365,7 +378,7 @@ def apply_late_session_filter(candidates):
         processed_rows.append(output_row)
 
         if position < total:
-            time.sleep(INTRADAY_REQUEST_INTERVAL_SECONDS)
+            time.sleep(random.uniform(INTRADAY_REQUEST_INTERVAL_SECONDS, 1.5))
 
     progress.empty()
     processed = pd.DataFrame(processed_rows).reset_index(drop=True)
@@ -686,9 +699,8 @@ def run_today_scan() -> None:
     )
     try:
         with st.spinner("正在获取行情并执行现有策略流程，请稍候……"):
-            # 完整扫描必须使用新鲜快照和分钟线，避免云端继续复用旧字段或旧尾盘结果。
+            # 基础快照刷新；分钟线保留90秒有效缓存，避免刷新页面重复轰炸接口。
             load_market_data.clear()
-            load_late_session_result.clear()
             market_data, updated_at = load_market_data()
             filter_result = apply_filters(market_data)
             initial_results = filter_result.initial
@@ -782,6 +794,8 @@ def run_today_scan() -> None:
         "current_beijing_time": datetime.now(MARKET_TIMEZONE),
         "deployment_commit_id": get_deployment_commit_id(),
         "base_market_row_count": len(market_data),
+        "runtime_environment": f"{platform.system()} · Python {platform.python_version()} · {'Streamlit Cloud' if os.getenv('STREAMLIT_SHARING_MODE') else '本地/自托管'}",
+        "eastmoney_circuit": get_eastmoney_circuit_status(),
         "excluded_results": excluded_results, "missing_records": missing_records,
     }
     if interface_errors:
@@ -798,6 +812,9 @@ def handle_pending_action() -> None:
     action = st.session_state.pending_action
     st.session_state.pending_action = None
     if action == "scan":
+        run_today_scan()
+    elif action == "refresh_minutes":
+        load_late_session_result.clear()
         run_today_scan()
     elif action == "refresh":
         refresh_market_snapshot()
@@ -961,14 +978,20 @@ def render_scan_results(payload: dict[str, object]) -> None:
     )
     diagnostic_columns = [
         "代码", "名称", "当前行情数据源", "分钟数据源", "分钟K线条数",
-        "接口错误原因", "当前北京时间", "数据更新时间",
+        "请求次数", "缓存命中状态", "缓存生成时间", "接口错误原因", "当前北京时间", "数据更新时间",
     ]
     with st.expander("行情与分钟接口诊断"):
         st.write(f"当前部署提交ID：{payload.get('deployment_commit_id', get_deployment_commit_id())}")
+        st.write(f"当前运行环境：{payload.get('runtime_environment', '--')}")
         st.write(f"当前北京时间：{payload.get('current_beijing_time', updated_at):%Y-%m-%d %H:%M:%S}")
         st.write(f"是否为交易日：{'是' if payload.get('is_trading_day') else '否'}")
         st.write(f"当前数据源：{st.session_state.get('data_source_status', '--')}")
         st.write(f"基础行情总行数：{int(payload.get('base_market_row_count', 0))}")
+        circuit = get_eastmoney_circuit_status()
+        st.write(f"东方财富熔断状态：{circuit['status']}（连续失败 {circuit['failures']} 次，请求 {circuit['request_count']} 次）")
+        if circuit.get("open_until"):
+            st.write(f"熔断恢复探测时间：{circuit['open_until']}")
+        st.write(f"最后一次异常：{circuit.get('last_exception') or '--'}")
         available_diagnostics = [column for column in diagnostic_columns if column in final_results]
         if available_diagnostics and not final_results.empty:
             st.dataframe(final_results[available_diagnostics], hide_index=True, width="stretch")
@@ -1307,7 +1330,7 @@ def _render_home_content(now: datetime) -> None:
         return
 
     st.markdown('<div class="section-label">今日操作</div>', unsafe_allow_html=True)
-    actions = st.columns(3)
+    actions = st.columns(4)
     scanning = bool(st.session_state.scan_in_progress)
     actions[0].button(
         "开始今日扫描", type="primary", width="stretch",
@@ -1320,6 +1343,11 @@ def _render_home_content(now: datetime) -> None:
         disabled=scanning,
     )
     actions[2].button(
+        "重新获取分钟行情", width="stretch",
+        on_click=queue_dashboard_action, args=("refresh_minutes",),
+        disabled=scanning,
+    )
+    actions[3].button(
         "查看历史记录", width="stretch",
         on_click=queue_dashboard_action, args=("history",),
         disabled=scanning,
