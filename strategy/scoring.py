@@ -68,7 +68,7 @@ def calculate_candidate_score(
     sector_score = _scaled(industry_change, SECTOR_CHANGE_SCORE_MIN, SECTOR_CHANGE_SCORE_MAX, SCORE_SECTOR_MAX)
     components.append(("所属板块近5日强度", SCORE_SECTOR_MAX, sector_score))
 
-    change_score = _centered(row.get("涨跌幅"), 0.0, 5.5, 10.0, SCORE_TREND_MAX * 0.6)
+    change_score = _centered(row.get("涨跌幅"), 0.0, 4.0, 10.0, SCORE_TREND_MAX * 0.6)
     position = None
     latest, high, low = (_number(row.get(name)) for name in ("最新价", "最高", "最低"))
     if latest is not None and high is not None and low is not None and high > low:

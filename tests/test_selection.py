@@ -8,6 +8,7 @@ from components.stock_table import _format_display_value
 from services.late_session import LateSessionDataError, analyze_late_session
 from services.market_data import MarketDataError, fetch_a_share_spot
 from services.trading_session import is_trading_day
+from strategy.filters import apply_filters
 from strategy.scoring import calculate_candidate_score
 from strategy.selection import build_valid_main_board_universe, select_layered_top5, stable_candidate_sort
 
@@ -59,6 +60,18 @@ class LayeredSelectionTests(unittest.TestCase):
         self.assertSetEqual(set(result.selected["入选类型"]), {
             "严格入选", "一级递补", "二级递补", "三级递补", "综合评分递补"
         })
+        supplemented=result.selected.loc[result.selected["入选类型"].ne("严格入选")]
+        self.assertTrue(supplemented["入选原因"].str.contains("未满足严格条件：").all())
+
+    def test_strict_change_range_includes_only_three_to_five_percent(self):
+        changes=[2.99,3.00,5.00,5.01]
+        rows=[]
+        for index,change in enumerate(changes,1):
+            row=candidate(index,strict=True,score=90)
+            row["涨跌幅"]=change
+            rows.append(row)
+        result=apply_filters(pd.DataFrame(rows)).final
+        self.assertListEqual(sorted(result["涨跌幅"].tolist()),[3.0,5.0])
 
     def test_less_than_five_valid_rows_reports_exact_shortage(self):
         result = select_layered_top5(pd.DataFrame([

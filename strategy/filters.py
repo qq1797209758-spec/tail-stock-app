@@ -55,11 +55,8 @@ def apply_filters(data: pd.DataFrame) -> FilterResult:
     initial = build_valid_main_board_universe(working)
 
     final_mask = (
-        initial["涨跌幅"].between(
-            PRICE_CHANGE_MIN,
-            PRICE_CHANGE_MAX,
-            inclusive="both",
-        )
+        initial["涨跌幅"].ge(PRICE_CHANGE_MIN)
+        & initial["涨跌幅"].le(PRICE_CHANGE_MAX)
         & initial["量比"].gt(VOLUME_RATIO_MIN)
         & initial["换手率"].between(
             TURNOVER_RATE_MIN,

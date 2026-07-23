@@ -9,6 +9,7 @@ from config import (
     EXCLUDED_NAME_KEYWORDS,
     ENRICHMENT_CANDIDATE_LIMIT,
     LEVEL1_PRICE_CHANGE_MIN,
+    LEVEL1_PRICE_CHANGE_MAX,
     LEVEL1_TURNOVER_RATE_MAX,
     LEVEL1_TURNOVER_RATE_MIN,
     LEVEL2_MARKET_CAP_MAX,
@@ -30,7 +31,7 @@ SELECTION_TYPES = (
     "严格入选", "一级递补", "二级递补", "三级递补", "综合评分递补"
 )
 LAYER_REASONS = {
-    "严格入选": "满足严格涨幅、量比、换手率、市值、20日涨停及尾盘结构条件",
+    "严格入选": f"满足严格涨幅{PRICE_CHANGE_MIN:g}%-{PRICE_CHANGE_MAX:g}%（含边界）、量比、换手率、市值、20日涨停及尾盘结构条件",
     "一级递补": "满足一级放宽后的涨幅2%-8%和换手率3%-12%条件",
     "二级递补": "满足二级放宽后的量比>0.8和市值20亿-500亿元条件",
     "三级递补": "尾盘结构合格，20日涨停由硬性条件改为评分项",
@@ -89,14 +90,17 @@ def build_enrichment_pool(
     ratio = pd.to_numeric(frame["量比"], errors="coerce")
     turnover = pd.to_numeric(frame["换手率"], errors="coerce")
     cap = pd.to_numeric(frame["总市值"], errors="coerce")
+    distance_to_strict = (PRICE_CHANGE_MIN - change).clip(lower=0) + (
+        change - PRICE_CHANGE_MAX
+    ).clip(lower=0)
     frame["_预评分"] = (
-        (1 - (change - 5.5).abs().div(5.5)).clip(0, 1).fillna(0) * 35
+        (1 - distance_to_strict.div(5)).clip(0, 1).fillna(0) * 35
         + ratio.div(3).clip(0, 1).fillna(0) * 25
         + (1 - (turnover - 7.5).abs().div(7.5)).clip(0, 1).fillna(0) * 20
         + cap.between(LEVEL2_MARKET_CAP_MIN, LEVEL2_MARKET_CAP_MAX).fillna(False).astype(int) * 20
     )
     relaxed = (
-        change.between(LEVEL1_PRICE_CHANGE_MIN, PRICE_CHANGE_MAX, inclusive="both")
+        change.between(LEVEL1_PRICE_CHANGE_MIN, LEVEL1_PRICE_CHANGE_MAX, inclusive="both")
         & turnover.between(LEVEL1_TURNOVER_RATE_MIN, LEVEL1_TURNOVER_RATE_MAX, inclusive="both")
         & ratio.gt(LEVEL2_VOLUME_RATIO_MIN)
         & cap.between(LEVEL2_MARKET_CAP_MIN, LEVEL2_MARKET_CAP_MAX, inclusive="both")
@@ -114,7 +118,9 @@ def selection_masks(scored: pd.DataFrame) -> dict[str, pd.Series]:
     """返回互相可重叠的层级资格；选择时按定义顺序去重。"""
     index = scored.index
     change_strict = _between(scored, "涨跌幅", PRICE_CHANGE_MIN, PRICE_CHANGE_MAX)
-    change_relaxed = _between(scored, "涨跌幅", LEVEL1_PRICE_CHANGE_MIN, PRICE_CHANGE_MAX)
+    change_relaxed = _between(
+        scored, "涨跌幅", LEVEL1_PRICE_CHANGE_MIN, LEVEL1_PRICE_CHANGE_MAX
+    )
     turnover_strict = _between(scored, "换手率", TURNOVER_RATE_MIN, TURNOVER_RATE_MAX)
     turnover_relaxed = _between(scored, "换手率", LEVEL1_TURNOVER_RATE_MIN, LEVEL1_TURNOVER_RATE_MAX)
     cap_strict = _between(scored, "总市值", MARKET_CAP_MIN, MARKET_CAP_MAX)
@@ -141,6 +147,11 @@ def stable_candidate_sort(frame: pd.DataFrame) -> pd.DataFrame:
         return pd.to_numeric(values, errors="coerce").fillna(default)
 
     result["_得分排序"] = sort_values("综合得分", float("-inf"))
+    change=sort_values("涨跌幅",float("inf"))
+    result["_涨幅距离排序"]=(
+        (PRICE_CHANGE_MIN-change).clip(lower=0)
+        +(change-PRICE_CHANGE_MAX).clip(lower=0)
+    )
     result["_完整度排序"] = sort_values("数据完整度", float("-inf"))
     fund_amount = sort_values("主力资金净流入", float("-inf"))
     fund_ratio = sort_values("主力净流入占比", float("-inf"))
@@ -150,10 +161,37 @@ def stable_candidate_sort(frame: pd.DataFrame) -> pd.DataFrame:
         "VWAP状态", pd.Series("", index=result.index)
     ).eq("合格").astype(int)
     return result.sort_values(
-        ["_得分排序", "_完整度排序", "_资金排序", "_VWAP排序", "_回撤排序", "代码"],
-        ascending=[False, False, False, False, True, True],
+        ["_得分排序", "_涨幅距离排序", "_完整度排序", "_资金排序", "_VWAP排序", "_回撤排序", "代码"],
+        ascending=[False, True, False, False, False, True, True],
         kind="mergesort",
-    ).drop(columns=["_得分排序", "_完整度排序", "_资金排序", "_VWAP排序", "_回撤排序"])
+    ).drop(columns=["_得分排序", "_涨幅距离排序", "_完整度排序", "_资金排序", "_VWAP排序", "_回撤排序"])
+
+
+def strict_condition_failures(row: pd.Series) -> str:
+    """列出递补股票未满足的严格条件，缺失字段也必须明确呈现。"""
+    failures: list[str] = []
+
+    def number(field: str) -> float | None:
+        value = pd.to_numeric(pd.Series([row.get(field)]), errors="coerce").iloc[0]
+        return None if pd.isna(value) else float(value)
+
+    change = number("涨跌幅")
+    if change is None or not PRICE_CHANGE_MIN <= change <= PRICE_CHANGE_MAX:
+        failures.append(f"当日涨幅不在{PRICE_CHANGE_MIN:g}%-{PRICE_CHANGE_MAX:g}%")
+    ratio = number("量比")
+    if ratio is None or ratio <= VOLUME_RATIO_MIN:
+        failures.append(f"量比未大于{VOLUME_RATIO_MIN:g}")
+    turnover = number("换手率")
+    if turnover is None or not TURNOVER_RATE_MIN <= turnover <= TURNOVER_RATE_MAX:
+        failures.append(f"换手率不在{TURNOVER_RATE_MIN:g}%-{TURNOVER_RATE_MAX:g}%")
+    cap = number("总市值")
+    if cap is None or not MARKET_CAP_MIN <= cap <= MARKET_CAP_MAX:
+        failures.append("总市值不在严格范围")
+    if row.get("20日内是否涨停") != "是":
+        failures.append("最近20日涨停条件未满足")
+    if row.get("尾盘结构状态") != "合格":
+        failures.append("尾盘结构条件未满足")
+    return "、".join(failures) or "无"
 
 
 def select_layered_top5(scored: pd.DataFrame, target: int = TARGET_SELECTION_COUNT) -> LayeredSelectionResult:
@@ -178,6 +216,12 @@ def select_layered_top5(scored: pd.DataFrame, target: int = TARGET_SELECTION_COU
             picked["入选类型"] = selection_type
             existing_reason = picked.get("入选原因", pd.Series("", index=picked.index)).fillna("").astype(str)
             picked["入选原因"] = LAYER_REASONS[selection_type] + "；" + existing_reason
+            if selection_type != "严格入选":
+                picked["入选原因"] = (
+                    picked["入选原因"]
+                    + "；未满足严格条件："
+                    + picked.apply(strict_condition_failures, axis=1)
+                )
             picked["入选原因"] = picked["入选原因"].str.rstrip("；")
             selected_parts.append(picked)
             selected_codes.update(picked["代码"].astype(str))

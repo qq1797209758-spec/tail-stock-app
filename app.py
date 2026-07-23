@@ -249,6 +249,7 @@ def render_strategy_sidebar() -> None:
         st.write(f"**市场范围：** 沪深主板（代码前缀：{'、'.join(MAIN_BOARD_CODE_PREFIXES)}）")
         st.write(f"**排除名称：** {'、'.join(EXCLUDED_NAME_KEYWORDS)}")
         st.write(f"**涨跌幅：** {PRICE_CHANGE_MIN:g}% ～ {PRICE_CHANGE_MAX:g}%")
+        st.caption("严格涨幅条件包含上下边界：3.0 ≤ 当日涨跌幅 ≤ 5.0。")
         st.write(f"**量比：** > {VOLUME_RATIO_MIN:g}")
         st.write(f"**换手率：** {TURNOVER_RATE_MIN:g}% ～ {TURNOVER_RATE_MAX:g}%")
         st.write(
