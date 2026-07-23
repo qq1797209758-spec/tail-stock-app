@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <meta name="theme-color" content="#0b1623">
+    <meta name="description" content="基于尾盘行情、资金、板块强度和历史复盘的A股量化研究工具。">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="尾盘助手">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="apple-touch-icon" href="/assets/icons/apple-touch-icon.png">
+    <link rel="apple-touch-startup-image" href="/assets/icons/apple-splash-1170x2532.png" media="(device-width: 390px) and (device-height: 844px) and (-webkit-device-pixel-ratio: 3)">
+    <link rel="icon" href="/assets/icons/favicon.ico" sizes="any">
+    <link rel="stylesheet" href="/assets/app.css">
+    <title>尾盘选股助手</title>
+  </head>
+  <body>
+    <div id="splash" class="splash" aria-label="应用正在启动">
+      <img src="/assets/icons/icon-192.png" alt="">
+      <strong>尾盘选股助手</strong>
+      <span>正在连接量化研究服务…</span>
+    </div>
+
+    <div id="offline-banner" class="network-banner" hidden>
+      当前网络不可用，数据可能不是最新。恢复网络后请重新获取行情。
+    </div>
+    <div id="update-banner" class="update-banner" hidden>
+      新版本已就绪。
+      <button id="update-button" type="button">刷新更新</button>
+    </div>
+
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">A股量化研究</p>
+        <h1>尾盘选股助手</h1>
+      </div>
+      <div class="header-actions">
+        <span id="online-status" class="status-pill">连接中</span>
+        <button id="install-button" class="secondary-button" type="button" hidden>安装应用</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="top5" class="view active" aria-labelledby="top5-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">今日研究名单</p>
+            <h2 id="top5-title">今日 Top5</h2>
+          </div>
+          <button id="refresh-button" class="primary-button" type="button">重新获取</button>
+        </div>
+        <p id="top5-updated" class="updated-time">数据更新时间：--</p>
+        <div id="top5-empty" class="empty-state" hidden>服务器尚未生成正式Top5。</div>
+        <div id="top5-cards" class="stock-cards"></div>
+        <div class="desktop-table-wrap">
+          <table>
+            <thead>
+              <tr><th>排名</th><th>代码</th><th>名称</th><th>当前价</th><th>涨幅</th><th>综合得分</th><th>入选类型</th><th>风险提示</th></tr>
+            </thead>
+            <tbody id="top5-table"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="daily" class="view" aria-labelledby="daily-title">
+        <p class="eyebrow">次日真实表现</p>
+        <h2 id="daily-title">每日复盘</h2>
+        <p class="updated-time">收益基准：推荐日不复权收盘价</p>
+        <div id="daily-content" class="review-list"></div>
+      </section>
+
+      <section id="history" class="view" aria-labelledby="history-title">
+        <p class="eyebrow">历史样本</p>
+        <h2 id="history-title">历史统计</h2>
+        <div id="history-metrics" class="metric-grid"></div>
+        <div id="history-list" class="review-list"></div>
+      </section>
+
+      <section id="settings" class="view" aria-labelledby="settings-title">
+        <p class="eyebrow">应用与研究口径</p>
+        <h2 id="settings-title">策略设置</h2>
+        <div class="settings-card">
+          <p>严格涨幅条件：3.0%—5.0%，包含上下边界。</p>
+          <p>安装版与网页版连接同一线上API和数据库，不在设备中保存密钥。</p>
+          <p id="install-help">正在检测当前浏览器的安装方式…</p>
+        </div>
+      </section>
+
+      <section id="status" class="view" aria-labelledby="status-title">
+        <p class="eyebrow">服务与数据</p>
+        <h2 id="status-title">系统状态</h2>
+        <div id="system-status" class="settings-card">正在连接服务器…</div>
+      </section>
+    </main>
+
+    <nav class="bottom-nav" aria-label="主导航">
+      <button class="nav-item active" data-view="top5" type="button"><span>TOP5</span><small>今日</small></button>
+      <button class="nav-item" data-view="daily" type="button"><span>复盘</span><small>每日</small></button>
+      <button class="nav-item" data-view="history" type="button"><span>统计</span><small>历史</small></button>
+      <button class="nav-item" data-view="settings" type="button"><span>设置</span><small>策略</small></button>
+      <button class="nav-item" data-view="status" type="button"><span>状态</span><small>系统</small></button>
+    </nav>
+
+    <footer>
+      历史复盘与模型评分仅用于量化研究，不代表未来收益，不构成投资建议。
+    </footer>
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>

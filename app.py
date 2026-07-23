@@ -81,11 +81,6 @@ from config import (
 from services.market_data import MarketDataError, fetch_a_share_spot
 from services.backtest_data import BacktestDataError, fetch_trade_calendar
 from services.history_data import HistoryDataError, analyze_recent_limit_up
-from services.ifind_client import (
-    IFindConnectionError,
-    fetch_test_realtime_quotes,
-    test_ifind_connection,
-)
 from services.late_session import (
     LateSessionDataError,
     analyze_late_session,
@@ -1058,6 +1053,7 @@ def render_status_and_metrics(now: datetime) -> None:
     updated_at = st.session_state.last_data_update
     updated_text = updated_at.strftime("%m-%d %H:%M:%S") if updated_at else "--"
     source_status = str(st.session_state.data_source_status)
+    source_display = "已连接" if source_status.startswith("正常") else source_status
     source_class = (
         "status-live" if source_status.startswith("正常")
         else "status-error" if source_status == "异常"
@@ -1068,7 +1064,7 @@ def render_status_and_metrics(now: datetime) -> None:
         ("当前时间", now.strftime("%H:%M:%S"), ""),
         ("A股市场状态", market_status, market_status_class),
         ("最近数据更新时间", updated_text, ""),
-        ("数据源状态", source_status, source_class),
+        ("数据源状态", source_display, source_class),
         ("接口健康", str(st.session_state.interface_health_status),
          "status-live" if st.session_state.interface_health_status == "正常" else "status-warn"),
         ("最近扫描耗时", "--" if st.session_state.last_scan_duration is None else f"{st.session_state.last_scan_duration:.1f}秒", ""),
@@ -1595,25 +1591,6 @@ def _render_home_content(now: datetime) -> None:
         on_click=queue_dashboard_action, args=("history",),
         disabled=scanning,
     )
-    if st.button("测试同花顺连接", width="stretch", disabled=scanning):
-        try:
-            with st.spinner("正在测试同花顺连接……"):
-                test_ifind_connection()
-            st.success("同花顺连接成功")
-        except IFindConnectionError as error:
-            st.error(f"同花顺连接失败：{error}")
-        except Exception:
-            st.error("同花顺连接失败：发生未知错误，请稍后重试。")
-    if st.button("测试同花顺实时行情", width="stretch", disabled=scanning):
-        try:
-            with st.spinner("正在获取两只股票的同花顺实时行情……"):
-                ifind_quotes = fetch_test_realtime_quotes()
-            st.caption("数据源：同花顺iFinD")
-            st.dataframe(pd.DataFrame(ifind_quotes), hide_index=True, width="stretch")
-        except IFindConnectionError as error:
-            st.error(f"同花顺实时行情测试失败：{error}")
-        except Exception:
-            st.error("同花顺实时行情测试失败：发生未知错误，请稍后重试。")
     st.caption(
         "同一时刻只允许一次完整扫描，扫描期间操作按钮会锁定。"
         "当前版本不安全中断已发出的公开数据请求；需强制终止时请停止 Streamlit 进程。"
@@ -1646,10 +1623,9 @@ def main() -> None:
         page_title=APP_TITLE,
         page_icon="📊",
         layout="wide",
-        initial_sidebar_state="expanded",
+        initial_sidebar_state="collapsed",
     )
     apply_responsive_styles()
-    render_strategy_sidebar()
     try:
         realtime_tab, daily_review_tab, historical_review_tab, backtest_tab = st.tabs(
             ["实时选股", "每日复盘", "历史复盘", "历史回测"]

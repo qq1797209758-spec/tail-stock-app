@@ -1,0 +1,43 @@
+const { chromium } = require("playwright");
+
+const widths = [320, 375, 768, 1440];
+const baseURL = process.env.PWA_TEST_URL || "http://127.0.0.1:8765";
+const chromePath =
+  process.env.CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+
+(async () => {
+  const browser = await chromium.launch({ headless: true, executablePath: chromePath });
+  const results = [];
+  for (const width of widths) {
+    const context = await browser.newContext({ viewport: { width, height: 900 } });
+    const page = await context.newPage();
+    await page.goto(baseURL, { waitUntil: "networkidle" });
+    await page.waitForSelector("#splash.hidden");
+    const metrics = await page.evaluate(() => ({
+      title: document.title,
+      overflow: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+      bottomNavVisible: getComputedStyle(document.querySelector(".bottom-nav")).display !== "none",
+      cardCount: document.querySelectorAll(".stock-card").length,
+      tableVisible: getComputedStyle(document.querySelector(".desktop-table-wrap")).display !== "none",
+    }));
+    await page.screenshot({ path: `output/pwa-${width}.png`, fullPage: true });
+    results.push({ width, ...metrics });
+    await context.close();
+  }
+
+  const context = await browser.newContext({ viewport: { width: 375, height: 900 } });
+  const page = await context.newPage();
+  await page.goto(baseURL, { waitUntil: "networkidle" });
+  await context.setOffline(true);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const offlineVisible = await page.locator("#offline-banner").isVisible();
+  await context.setOffline(false);
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await page.waitForTimeout(500);
+  const recovered = !(await page.locator("#offline-banner").isVisible());
+  await context.close();
+  await browser.close();
+
+  console.log(JSON.stringify({ results, offlineVisible, recovered }, null, 2));
+  if (results.some(item => item.overflow) || !offlineVisible || !recovered) process.exit(1);
+})();

@@ -310,12 +310,12 @@ def run_historical_backtest(
             calendar_position = calendar.get_indexer([selection])[0]
             history_start = calendar[max(0, calendar_position - 26)]
             daily_history = fetch_daily_history(
-                tuple(universe["同花顺代码"]),
+                tuple(universe["数据源代码"]),
                 history_start.strftime("%Y-%m-%d"),
                 next_day.strftime("%Y-%m-%d"),
             )
             today_rows = daily_history.loc[daily_history["日期"].eq(selection)].merge(
-                universe, on="同花顺代码", how="inner"
+                universe, on="数据源代码", how="inner"
             )
             required_today = ["涨跌幅", "换手率", "开盘", "最高", "最低", "收盘"]
             incomplete_today = int(today_rows[required_today].isna().any(axis=1).sum())
@@ -328,8 +328,8 @@ def run_historical_backtest(
                 & today_rows["换手率"].between(TURNOVER_RATE_MIN, TURNOVER_RATE_MAX)
             ].copy()
             if not coarse.empty:
-                shares = fetch_total_shares(tuple(coarse["同花顺代码"]), day_label)
-                coarse = coarse.merge(shares, on="同花顺代码", how="left")
+                shares = fetch_total_shares(tuple(coarse["数据源代码"]), day_label)
+                coarse = coarse.merge(shares, on="数据源代码", how="left")
                 coarse["总市值"] = coarse["收盘"] * coarse["总股本"]
                 missing_shares = coarse.loc[coarse["总股本"].isna()]
                 for _, item in missing_shares.iterrows():
@@ -338,9 +338,9 @@ def run_historical_backtest(
 
             candidates: list[dict[str, object]] = []
             for candidate_index, (_, row) in enumerate(coarse.iterrows()):
-                code = row["同花顺代码"]
+                code = row["数据源代码"]
                 try:
-                    stock_history = daily_history.loc[daily_history["同花顺代码"].eq(code)]
+                    stock_history = daily_history.loc[daily_history["数据源代码"].eq(code)]
                     limit_count = _recent_limit_up_count(stock_history, selection)
                     if limit_count is None:
                         raise BacktestDataError("当日前20日涨停判断数据不足")
@@ -412,7 +412,7 @@ def run_historical_backtest(
                         "是否盈利": "是" if selected_return > 0 else "否",
                         "数据完整性": 0.60,
                         "数据缺失项": "历史主力资金、历史板块强度（对应评分计0分）",
-                        "数据来源": "同花顺iFinD历史股票池/日线/分钟线；AKShare交易日历",
+                        "数据来源": "已配置历史行情接口；AKShare交易日历",
                     }
                 )
             details.extend(selected_rows)

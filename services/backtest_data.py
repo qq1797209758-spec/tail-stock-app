@@ -145,10 +145,10 @@ def fetch_historical_universe(selection_date: str) -> pd.DataFrame:
             for row in rows:
                 code = _find_code(row)
                 if code:
-                    records.append({"同花顺代码": code, "名称": _find_name(row, code)})
-            result = pd.DataFrame(records).drop_duplicates("同花顺代码")
+                    records.append({"数据源代码": code, "名称": _find_name(row, code)})
+            result = pd.DataFrame(records).drop_duplicates("数据源代码")
             if not result.empty:
-                result["代码"] = result["同花顺代码"].str[:6]
+                result["代码"] = result["数据源代码"].str[:6]
                 return result.reset_index(drop=True)
         except IFindConnectionError as error:
             last_error = error
@@ -189,7 +189,7 @@ def fetch_daily_history(
                 continue
             records.append(
                 {
-                    "同花顺代码": code,
+                    "数据源代码": code,
                     "日期": trade_time,
                     "开盘": _column(row, "open"),
                     "最高": _column(row, "high"),
@@ -211,8 +211,8 @@ def fetch_daily_history(
     result["日期"] = pd.to_datetime(result["日期"], errors="coerce").dt.normalize()
     for column in ("开盘", "最高", "最低", "收盘", "成交量", "成交额", "涨跌幅", "换手率"):
         result[column] = pd.to_numeric(result[column], errors="coerce")
-    return result.dropna(subset=["同花顺代码", "日期"]).sort_values(
-        ["同花顺代码", "日期"]
+    return result.dropna(subset=["数据源代码", "日期"]).sort_values(
+        ["数据源代码", "日期"]
     ).reset_index(drop=True)
 
 
@@ -239,14 +239,14 @@ def fetch_total_shares(codes: tuple[str, ...], selection_date: str) -> pd.DataFr
             code = _find_code(row)
             shares = _column(row, "ths_total_shares_stock")
             if code:
-                records.append({"同花顺代码": code, "总股本": shares})
+                records.append({"数据源代码": code, "总股本": shares})
         if records:
             frames.append(pd.DataFrame(records))
         if batch_index + 1 < (len(codes) + BACKTEST_BASIC_BATCH_SIZE - 1) // BACKTEST_BASIC_BATCH_SIZE:
             time.sleep(BACKTEST_REQUEST_INTERVAL_SECONDS)
     if not frames:
-        return pd.DataFrame(columns=["同花顺代码", "总股本"])
-    result = pd.concat(frames, ignore_index=True).drop_duplicates("同花顺代码")
+        return pd.DataFrame(columns=["数据源代码", "总股本"])
+    result = pd.concat(frames, ignore_index=True).drop_duplicates("数据源代码")
     result["总股本"] = pd.to_numeric(result["总股本"], errors="coerce")
     return result
 
@@ -274,7 +274,7 @@ def fetch_historical_minutes(
         row_code = _find_code(row) or code
         records.append(
             {
-                "同花顺代码": row_code,
+                "数据源代码": row_code,
                 "时间": _column(row, "time"),
                 "开盘": _column(row, "open"),
                 "最高": _column(row, "high"),

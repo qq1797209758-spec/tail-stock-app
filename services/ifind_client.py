@@ -1,4 +1,4 @@
-"""同花顺 iFinD HTTP 鉴权的最小连接客户端。"""
+"""历史行情 HTTP 鉴权客户端。"""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def _sanitize_provider_message(value: object) -> str:
     """清理第三方错误文本中的 token 形态和超长内容。"""
     message = str(value or "").strip()
     if not message:
-        return "同花顺返回未说明的错误"
+        return "历史行情服务返回未说明的错误"
     message = re.sub(
         r"(?i)(?:refresh_token|access_token|token)\s*[:=]\s*[^\s,;]+",
         "token=[已隐藏]",
@@ -96,20 +96,20 @@ def _request_access_token(refresh_token: str) -> str:
     try:
         payload = response.json()
     except (requests.JSONDecodeError, ValueError) as error:
-        raise IFindConnectionError("同花顺返回了无法解析的 JSON 数据。") from error
+        raise IFindConnectionError("历史行情服务返回了无法解析的 JSON 数据。") from error
 
     if not isinstance(payload, dict):
-        raise IFindConnectionError("同花顺返回的数据格式不正确。")
+        raise IFindConnectionError("历史行情服务返回的数据格式不正确。")
     provider_error = _extract_provider_error(payload)
     if provider_error is not None:
         code, message = provider_error
         safe_code = _sanitize_provider_message(code)
-        raise IFindConnectionError(f"同花顺错误码 {safe_code}：{message}")
+        raise IFindConnectionError(f"历史行情服务错误码 {safe_code}：{message}")
 
     data = payload.get("data")
     access_token = data.get("access_token") if isinstance(data, dict) else None
     if not isinstance(access_token, str) or not access_token.strip():
-        raise IFindConnectionError("同花顺响应中缺少有效的 access_token。")
+        raise IFindConnectionError("历史行情服务响应中缺少有效的 access_token。")
     return access_token.strip()
 
 
@@ -172,15 +172,15 @@ def _request_realtime_payload(access_token: str) -> dict[str, Any]:
     try:
         payload = response.json()
     except (requests.JSONDecodeError, ValueError) as error:
-        raise IFindConnectionError("同花顺实时行情返回了无法解析的 JSON 数据。") from error
+        raise IFindConnectionError("实时行情服务返回了无法解析的 JSON 数据。") from error
     if not isinstance(payload, dict):
-        raise IFindConnectionError("同花顺实时行情返回的数据格式不正确。")
+        raise IFindConnectionError("实时行情服务返回的数据格式不正确。")
 
     provider_error = _extract_provider_error(payload)
     if provider_error is not None:
         code, message = provider_error
         raise IFindConnectionError(
-            f"同花顺错误码 {_sanitize_provider_message(code)}：{message}"
+            f"行情服务错误码 {_sanitize_provider_message(code)}：{message}"
         )
     return payload
 
@@ -203,7 +203,7 @@ def _numeric_value(value: object) -> float | None:
 def _parse_realtime_tables(payload: dict[str, Any]) -> list[dict[str, object]]:
     tables = payload.get("tables")
     if not isinstance(tables, list) or not tables:
-        raise IFindConnectionError("同花顺实时行情响应中缺少行情表格。")
+        raise IFindConnectionError("实时行情服务响应中缺少行情表格。")
 
     parsed: dict[str, dict[str, object]] = {}
     for item in tables:
@@ -232,12 +232,12 @@ def _parse_realtime_tables(payload: dict[str, Any]) -> list[dict[str, object]]:
                 "开盘价": _numeric_value(_value_at(table.get("open"), index)),
                 "最高价": _numeric_value(_value_at(table.get("high"), index)),
                 "最低价": _numeric_value(_value_at(table.get("low"), index)),
-                "数据源": "同花顺iFinD",
+                "数据源": "历史行情服务",
             }
 
     missing_codes = [code for code in IFIND_TEST_CODES if code not in parsed]
     if missing_codes:
-        raise IFindConnectionError("同花顺实时行情响应缺少指定股票数据。")
+        raise IFindConnectionError("实时行情服务响应缺少指定股票数据。")
     return [parsed[code] for code in IFIND_TEST_CODES]
 
 
@@ -290,6 +290,6 @@ def post_authenticated_json(
     if provider_error is not None:
         code, message = provider_error
         raise IFindConnectionError(
-            f"同花顺错误码 {_sanitize_provider_message(code)}：{message}"
+            f"历史行情服务错误码 {_sanitize_provider_message(code)}：{message}"
         )
     return result

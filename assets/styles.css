@@ -18,6 +18,13 @@ body {
     background: rgba(11, 22, 35, 0.82);
 }
 
+[data-testid="stToolbar"],
+[data-testid="stAppDeployButton"],
+.stAppDeployButton,
+#MainMenu {
+    display: none !important;
+}
+
 [data-testid="stSidebar"] {
     background: #101f2e;
     border-right: 1px solid #22384c;
