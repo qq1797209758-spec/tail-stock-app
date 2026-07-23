@@ -1,4 +1,4 @@
-﻿const VERSION = "tail-stock-pwa-v2";
+const VERSION = "tail-stock-pwa-v3-auth";
 const STATIC_CACHE = `${VERSION}-static`;
 const SHELL_CACHE = `${VERSION}-shell`;
 const STATIC_ASSETS = [
