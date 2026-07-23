@@ -1625,15 +1625,6 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="collapsed",
     )
-    if os.getenv("REQUIRE_INVITE_AUTH", "true").lower() not in {"0", "false", "no"}:
-        st.title("安全访问已启用")
-        st.error("此 Streamlit 旧入口不支持安全的长期 HttpOnly Cookie，已停止提供股票数据。")
-        pwa_url = os.getenv("PWA_PUBLIC_URL", "").strip()
-        if pwa_url:
-            st.link_button("前往邀请码验证页面", pwa_url)
-        else:
-            st.info("请管理员配置 PWA_PUBLIC_URL，并通过 FastAPI/PWA HTTPS 入口访问。")
-        st.stop()
     apply_responsive_styles()
     try:
         realtime_tab, daily_review_tab, historical_review_tab, backtest_tab = st.tabs(

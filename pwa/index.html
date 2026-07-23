@@ -30,48 +30,6 @@
       <button id="update-button" type="button">刷新更新</button>
     </div>
 
-    <main id="auth-gate" class="auth-gate">
-      <section class="auth-card" aria-labelledby="invite-title">
-        <img src="/assets/icons/icon-192.png" alt="" class="auth-logo">
-        <p class="eyebrow">安全访问</p>
-        <h1 id="invite-title">邀请码验证</h1>
-        <p class="updated-time">请输入有效邀请码以访问量化研究数据。</p>
-        <form id="invite-form">
-          <label for="invite-code">邀请码</label>
-          <input id="invite-code" name="invite-code" type="text" inputmode="text"
-                 autocomplete="one-time-code" maxlength="32" placeholder="TAIL-7K9P-X3M8" required>
-          <button class="primary-button auth-submit" type="submit">验证并进入</button>
-        </form>
-        <p id="auth-error" class="auth-error" role="alert" hidden>邀请码无效或已过期</p>
-        <button id="show-admin-login" class="text-button" type="button">管理员入口</button>
-      </section>
-      <section id="admin-login-card" class="auth-card" hidden>
-        <h2>管理员认证</h2>
-        <form id="admin-login-form">
-          <label for="admin-username">管理员账号</label>
-          <input id="admin-username" autocomplete="username" required>
-          <label for="admin-password">管理员密码</label>
-          <input id="admin-password" type="password" autocomplete="current-password" required>
-          <button class="primary-button auth-submit" type="submit">进入管理页面</button>
-        </form>
-        <p id="admin-error" class="auth-error" role="alert" hidden>管理员认证失败</p>
-      </section>
-      <section id="admin-panel" class="admin-panel" hidden>
-        <div class="section-heading"><h2>邀请码管理</h2><button id="admin-logout" class="secondary-button">退出管理</button></div>
-        <form id="invite-create-form" class="admin-form">
-          <label>生成数量<input id="invite-count" type="number" min="1" max="100" value="1"></label>
-          <label>最大使用次数<input id="invite-max-uses" type="number" min="1" value="1"></label>
-          <label>到期时间<input id="invite-expires" type="datetime-local"></label>
-          <label>备注<input id="invite-note" maxlength="200"></label>
-          <button class="primary-button" type="submit">生成邀请码</button>
-        </form>
-        <div id="new-invite-codes" class="new-code-box" hidden></div>
-        <a class="secondary-button download-link" href="/api/admin/invites.csv">导出发放记录</a>
-        <div id="invite-admin-list" class="review-list"></div>
-      </section>
-    </main>
-
-    <div id="app-shell" hidden>
     <header class="app-header">
       <div>
         <p class="eyebrow">A股量化研究</p>
@@ -80,7 +38,6 @@
       <div class="header-actions">
         <span id="online-status" class="status-pill">连接中</span>
         <button id="install-button" class="secondary-button" type="button" hidden>安装应用</button>
-        <button id="logout-button" class="secondary-button" type="button">退出登录</button>
       </div>
     </header>
 
@@ -148,7 +105,6 @@
     <footer>
       历史复盘与模型评分仅用于量化研究，不代表未来收益，不构成投资建议。
     </footer>
-    </div>
     <script src="/assets/app.js" defer></script>
   </body>
 </html>

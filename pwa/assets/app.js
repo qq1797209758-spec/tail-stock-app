@@ -1,6 +1,5 @@
-const state = { deferredPrompt: null, csrfToken: null };
+const state = { deferredPrompt: null };
 const $ = selector => document.querySelector(selector);
-const apiBase = "";
 const formatNumber = (value, digits = 2) => value == null || !Number.isFinite(Number(value)) ? "--" : Number(value).toFixed(digits);
 const formatPercent = value => value == null || !Number.isFinite(Number(value)) ? "--" : `${Number(value).toFixed(2)}%`;
 const formatReturn = value => value == null || !Number.isFinite(Number(value)) ? "--" : `${(Number(value) * 100).toFixed(2)}%`;
@@ -8,62 +7,9 @@ const tone = value => Number(value) > 0 ? "positive" : Number(value) < 0 ? "nega
 const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
 
 async function api(path) {
-  const response = await fetch(`${apiBase}${path}`, {
-    cache: "no-store", credentials: "include", headers: {"Accept": "application/json"}
-  });
-  if (response.status === 401 && !path.startsWith("/api/auth/") && !path.startsWith("/api/admin/")) {
-    showAuthGate();
-  }
+  const response = await fetch(path, {cache: "no-store", headers: {"Accept": "application/json"}});
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
-}
-
-async function mutate(path, payload = {}) {
-  if (!state.csrfToken) await refreshCsrf();
-  const response = await fetch(`${apiBase}${path}`, {
-    method: "POST",
-    cache: "no-store",
-    credentials: "include",
-    headers: {
-      "Accept": "application/json",
-      "Content-Type": "application/json",
-      "X-CSRF-Token": state.csrfToken
-    },
-    body: JSON.stringify(payload)
-  });
-  if (!response.ok) {
-    const error = new Error(`HTTP ${response.status}`);
-    error.status = response.status;
-    throw error;
-  }
-  return response.json();
-}
-
-async function refreshCsrf() {
-  const payload = await api("/api/auth/csrf");
-  state.csrfToken = payload.csrf_token;
-}
-
-function clearProtectedContent() {
-  $("#top5-cards").replaceChildren();
-  $("#top5-table").replaceChildren();
-  $("#daily-content").replaceChildren();
-  $("#history-metrics").replaceChildren();
-  $("#history-list").replaceChildren();
-  $("#system-status").textContent = "";
-}
-
-function showAuthGate() {
-  clearProtectedContent();
-  $("#app-shell").hidden = true;
-  $("#auth-gate").hidden = false;
-  $("#admin-panel").hidden = true;
-  $("#invite-code").focus();
-}
-
-function showApp() {
-  $("#auth-gate").hidden = true;
-  $("#app-shell").hidden = false;
 }
 
 function renderTop5(payload) {
@@ -145,133 +91,6 @@ async function loadAll() {
   }
 }
 
-async function initializeAuth() {
-  try {
-    await refreshCsrf();
-    const status = await api("/api/auth/status");
-    if (status.authenticated) {
-      showApp();
-      await loadAll();
-    } else {
-      showAuthGate();
-    }
-  } catch (error) {
-    showAuthGate();
-    $("#offline-banner").hidden = navigator.onLine;
-    $("#auth-error").textContent = "安全服务未配置或暂时不可用";
-    $("#auth-error").hidden = false;
-  } finally {
-    setTimeout(() => $("#splash").classList.add("hidden"), 250);
-  }
-}
-
-$("#invite-code").addEventListener("input", event => {
-  event.target.value = event.target.value.trimStart().toUpperCase();
-});
-$("#invite-form").addEventListener("submit", async event => {
-  event.preventDefault();
-  const button = event.submitter;
-  button.disabled = true;
-  $("#auth-error").hidden = true;
-  try {
-    await mutate("/api/auth/invite", {
-      code: $("#invite-code").value.trim().toUpperCase(),
-      device_label: navigator.userAgent
-    });
-    $("#invite-code").value = "";
-    showApp();
-    await loadAll();
-  } catch (error) {
-    $("#auth-error").textContent = "邀请码无效或已过期";
-    $("#auth-error").hidden = false;
-  } finally {
-    button.disabled = false;
-  }
-});
-$("#logout-button").addEventListener("click", async () => {
-  try { await mutate("/api/auth/logout"); } finally { showAuthGate(); }
-});
-
-$("#show-admin-login").addEventListener("click", () => {
-  $("#admin-login-card").hidden = !$("#admin-login-card").hidden;
-});
-$("#admin-login-form").addEventListener("submit", async event => {
-  event.preventDefault();
-  $("#admin-error").hidden = true;
-  try {
-    await mutate("/api/admin/login", {
-      username: $("#admin-username").value,
-      password: $("#admin-password").value
-    });
-    $("#admin-password").value = "";
-    $("#admin-login-card").hidden = true;
-    $("#admin-panel").hidden = false;
-    await loadInvites();
-  } catch (error) {
-    $("#admin-error").textContent = "管理员认证失败";
-    $("#admin-error").hidden = false;
-  }
-});
-$("#admin-logout").addEventListener("click", async () => {
-  try { await mutate("/api/admin/logout"); } finally {
-    $("#admin-panel").hidden = true;
-    $("#admin-login-card").hidden = false;
-  }
-});
-
-async function loadInvites() {
-  const payload = await api("/api/admin/invites");
-  $("#invite-admin-list").innerHTML = payload.items.map(item => `
-    <article class="review-item">
-      <div><span>邀请码</span><strong>${escapeHtml(item.code_prefix)}</strong></div>
-      <div><span>备注</span><strong>${escapeHtml(item.note || "--")}</strong></div>
-      <div><span>使用</span><strong>${item.used_count}/${item.max_uses}</strong></div>
-      <div><span>状态</span><strong>${item.is_active ? "启用" : "停用"}</strong></div>
-      <div><span>到期</span><strong>${escapeHtml(item.expires_at || "永久")}</strong></div>
-      <div><span>最后使用</span><strong>${escapeHtml(item.last_used_at || "--")}</strong></div>
-      <div class="admin-actions">
-        <button class="secondary-button invite-status" data-id="${item.id}" data-active="${item.is_active ? 0 : 1}">
-          ${item.is_active ? "停用并撤销" : "重新启用"}
-        </button>
-        <button class="secondary-button revoke-sessions" data-id="${item.id}">撤销会话</button>
-      </div>
-    </article>`).join("");
-}
-$("#invite-admin-list").addEventListener("click", async event => {
-  const button = event.target.closest("button");
-  if (!button) return;
-  button.disabled = true;
-  try {
-    if (button.classList.contains("invite-status")) {
-      await mutate(`/api/admin/invites/${button.dataset.id}/status`, {
-        is_active: button.dataset.active === "1"
-      });
-    } else if (button.classList.contains("revoke-sessions")) {
-      await mutate(`/api/admin/invites/${button.dataset.id}/revoke-sessions`);
-    }
-    await loadInvites();
-  } finally {
-    button.disabled = false;
-  }
-});
-$("#invite-create-form").addEventListener("submit", async event => {
-  event.preventDefault();
-  const expires = $("#invite-expires").value;
-  const payload = await mutate("/api/admin/invites", {
-    count: Number($("#invite-count").value),
-    max_uses: Number($("#invite-max-uses").value),
-    expires_at: expires ? new Date(expires).toISOString() : null,
-    note: $("#invite-note").value.trim()
-  });
-  const box = $("#new-invite-codes");
-  box.hidden = false;
-  box.innerHTML = `<strong>完整邀请码仅显示这一次：</strong><br>${payload.codes.map(code =>
-    `<code>${escapeHtml(code)}</code>`).join("<br>")}
-    <br><button id="copy-new-codes" class="secondary-button" type="button">复制全部</button>`;
-  $("#copy-new-codes").addEventListener("click", () => navigator.clipboard.writeText(payload.codes.join("\n")));
-  await loadInvites();
-});
-
 document.querySelectorAll(".nav-item").forEach(button => button.addEventListener("click", () => {
   document.querySelectorAll(".nav-item").forEach(item => item.classList.toggle("active", item === button));
   document.querySelectorAll(".view").forEach(view => view.classList.toggle("active", view.id === button.dataset.view));
@@ -298,7 +117,7 @@ $("#install-help").textContent = standalone
     : "Chrome或Edge支持时，页面会显示“安装应用”按钮；其他浏览器可继续作为普通网站使用。";
 
 window.addEventListener("offline", () => { $("#offline-banner").hidden = false; $("#online-status").textContent = "离线"; });
-window.addEventListener("online", () => { $("#offline-banner").hidden = true; initializeAuth(); });
+window.addEventListener("online", () => { $("#offline-banner").hidden = true; loadAll(); });
 $("#refresh-button").addEventListener("click", loadAll);
 
 if ("serviceWorker" in navigator) {
@@ -317,4 +136,4 @@ $("#update-button").addEventListener("click", async () => {
   registration?.waiting?.postMessage("SKIP_WAITING");
 });
 
-initializeAuth();
+loadAll();
