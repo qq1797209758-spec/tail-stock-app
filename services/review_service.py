@@ -103,11 +103,11 @@ def _conclusion(values: dict, exit_reason: str) -> str:
 
 
 def run_pending_reviews(repository: ReviewRepository, now: datetime | None = None,
-                        quote_fetcher=_daily_quote) -> dict[str, int]:
+                        quote_fetcher=_daily_quote, limit: int = 20) -> dict[str, int]:
     now=(now or datetime.now(SHANGHAI)).astimezone(SHANGHAI)
     calendar=fetch_trade_calendar()
     counts={"completed":0,"waiting":0,"failed":0}
-    for item in repository.pending_recommendations():
+    for item in repository.pending_recommendations(limit=limit):
         recommendation_day=date.fromisoformat(item["run_recommendation_date"])
         review_day=next_trade_date(recommendation_day,calendar)
         base=item.get("recommendation_close") or item.get("recommended_price")

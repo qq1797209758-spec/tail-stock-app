@@ -18,17 +18,6 @@ from services.review_store import SQLiteReviewRepository
 DISCLAIMER="历史复盘与模型评分仅用于量化研究，不代表未来收益，不构成投资建议。"
 
 
-@st.fragment(run_every="10m")
-def _auto_review_fragment(repository: SQLiteReviewRepository) -> None:
-    """浏览器保持打开时定时检查；离线无人值守需外部调度器。"""
-    try:
-        result=run_pending_reviews(repository)
-        if result["completed"] or result["failed"]:
-            st.caption(f"自动复盘检查：完成{result['completed']}，待补录{result['failed']}。")
-    except Exception as error:
-        st.caption(f"自动复盘检查暂不可用：{type(error).__name__}")
-
-
 def _pct(value: object) -> str:
     try: numeric=float(value)
     except (TypeError,ValueError): return "数据不足"
@@ -50,10 +39,11 @@ def _summary(frame: pd.DataFrame) -> dict[str, object]:
 def render_daily_review(repository: SQLiteReviewRepository) -> None:
     st.markdown("## 每日复盘")
     st.caption("收益基准：推荐日不复权收盘价。日线统一使用不复权口径；停牌或缺失数据保持待补录。")
-    _auto_review_fragment(repository)
+    pending_count=repository.pending_count()
+    st.info(f"当前待复盘/待补录：{pending_count} 条。复盘任务与今日选股扫描分离，每次最多处理20条。")
     if st.button("手动补录复盘",type="primary"):
         with st.spinner("正在检查待复盘记录……"):
-            result=run_pending_reviews(repository)
+            result=run_pending_reviews(repository,limit=20)
         st.success(f"完成 {result['completed']} 条，等待 {result['waiting']} 条，待补录 {result['failed']} 条。")
     frame=repository.review_frame()
     if frame.empty:

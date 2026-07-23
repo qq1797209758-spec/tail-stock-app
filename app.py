@@ -1,6 +1,7 @@
 """A股尾盘策略筛选 Web 应用。"""
 
 from datetime import datetime, time as clock_time
+from concurrent.futures import ThreadPoolExecutor, wait
 from html import escape
 from pathlib import Path
 import os
@@ -29,6 +30,7 @@ from config import (
     BACKTEST_MAX_STOCKS_LIMIT,
     BACKTEST_MAX_TRADING_DAYS,
     DATA_CACHE_TTL,
+    DEEP_ANALYSIS_LIMIT,
     EXCLUDED_NAME_KEYWORDS,
     FUND_FLOW_NET_RATIO_MAX,
     FUND_FLOW_NET_RATIO_MIN,
@@ -66,6 +68,8 @@ from config import (
     SCORING_CACHE_TTL,
     SCORING_MAX_RESULTS,
     SCORING_REQUEST_INTERVAL_SECONDS,
+    SCAN_HARD_LIMIT_SECONDS,
+    SCAN_MAX_WORKERS,
     SCAN_HISTORY_DATABASE,
     SECTOR_CHANGE_SCORE_MAX,
     SECTOR_CHANGE_SCORE_MIN,
@@ -92,6 +96,7 @@ from services.review_store import SQLiteReviewRepository
 from services.review_service import (
     indicator_effectiveness, learning_status, run_pending_reviews,
 )
+from services.scan_performance import ScanPerformance
 from services.scoring_data import (
     ScoringDataError,
     fetch_industry_strength,
@@ -109,12 +114,24 @@ from strategy.filters import apply_filters
 from strategy.backtest import BacktestResult, run_historical_backtest
 from strategy.reporting import build_excluded_results, build_missing_records
 from strategy.scoring import calculate_candidate_score
-from strategy.selection import build_enrichment_pool, select_layered_top5
+from strategy.selection import build_enrichment_pool, select_layered_top5, stable_candidate_sort
 from utils.logger import get_logger
 
 
 logger = get_logger(__name__)
-_SCAN_LOCK = Lock()
+
+
+@st.cache_resource(show_spinner=False)
+def get_scan_memory_cache():
+    return {"lock":Lock(),"scan_lock":Lock(),"history":{},"context":{},"board":{}}
+
+
+_SCAN_MEMORY=get_scan_memory_cache()
+_SCAN_MEMO_LOCK=_SCAN_MEMORY["lock"]
+_SCAN_LOCK=_SCAN_MEMORY["scan_lock"]
+_SCAN_HISTORY_MEMO=_SCAN_MEMORY["history"]
+_SCAN_CONTEXT_MEMO=_SCAN_MEMORY["context"]
+_SCAN_BOARD_MEMO=_SCAN_MEMORY["board"]
 
 
 def get_strategy_parameter_snapshot() -> dict[str, object]:
@@ -182,7 +199,9 @@ def load_market_data(cache_version: str = CACHE_SCHEMA_VERSION):
 @st.cache_data(ttl=HISTORY_CACHE_TTL, show_spinner=False)
 def load_limit_up_result(stock_code: str) -> dict[str, str]:
     """缓存单股历史判断，避免重复请求同一股票。"""
-    return analyze_recent_limit_up(stock_code)
+    result=analyze_recent_limit_up(stock_code)
+    result["缓存生成时间"]=datetime.now(MARKET_TIMEZONE).isoformat(timespec="seconds")
+    return result
 
 
 @st.cache_data(ttl=INTRADAY_CACHE_TTL, show_spinner=False)
@@ -287,7 +306,7 @@ def render_strategy_sidebar() -> None:
             )
 
 
-def apply_limit_up_filter(candidates):
+def apply_limit_up_filter(candidates, budget: ScanPerformance | None = None):
     """只对第一轮候选股执行历史涨停二次筛选。"""
     if candidates.empty:
         empty = candidates.copy()
@@ -297,21 +316,29 @@ def apply_limit_up_filter(candidates):
         empty["20日涨停次数"] = pd.Series(dtype="int64")
         empty["数据状态"] = pd.Series(dtype="string")
         empty["历史错误原因"] = pd.Series(dtype="string")
+        empty["缓存生成时间"] = pd.Series(dtype="string")
         return empty, empty.copy()
 
     processed_rows = []
     total = len(candidates)
     progress = st.progress(0, text="准备查询个股历史行情……")
 
-    for position, (_, row) in enumerate(candidates.iterrows(), start=1):
-        stock_code = str(row["代码"]).zfill(6)
-        stock_name = str(row["名称"])
-        progress.progress(
-            position / total,
-            text=f"正在处理 {position}/{total}：{stock_name}（{stock_code}）",
-        )
+    rows=[row.copy() for _,row in candidates.iterrows()]
+    def fetch(row):
+        stock_code=str(row["代码"]).zfill(6)
+        memo_key=(datetime.now(MARKET_TIMEZONE).date().isoformat(),stock_code)
+        with _SCAN_MEMO_LOCK:
+            memo=_SCAN_HISTORY_MEMO.get(memo_key)
+        if memo is not None:
+            result=dict(memo); result["_缓存命中"]=True
+            return row,result
         try:
             result = load_limit_up_result(stock_code)
+            generated=pd.to_datetime(result.get("缓存生成时间"),errors="coerce")
+            result["_缓存命中"]=bool(
+                pd.notna(generated)
+                and (pd.Timestamp.now(tz=MARKET_TIMEZONE)-generated).total_seconds()>2
+            )
         except HistoryDataError as error:
             logger.warning("股票 %s 历史判断跳过：%s", stock_code, error)
             result = {
@@ -332,17 +359,34 @@ def apply_limit_up_filter(candidates):
                 "涨停判断": "数据不足",
                 "历史错误原因": f"未知错误（{type(error).__name__}）",
             }
+        with _SCAN_MEMO_LOCK:
+            _SCAN_HISTORY_MEMO[memo_key]=dict(result)
+        return row,result
 
+    executor=ThreadPoolExecutor(max_workers=SCAN_MAX_WORKERS)
+    futures=[executor.submit(fetch,row) for row in rows]
+    timeout=10 if budget is None else min(10,max(0.1,budget.remaining()-20))
+    done,pending=wait(futures,timeout=timeout)
+    for future in pending: future.cancel()
+    executor.shutdown(wait=False,cancel_futures=True)
+    completed={future:future.result() for future in done if not future.cancelled()}
+    for position,future in enumerate(futures,start=1):
+        if future not in completed:
+            row=rows[position-1]
+            result={"20日内是否涨停":"无法验证","最近涨停日期":"","20日涨停次数":0,
+                    "数据状态":"预算停止","涨停判断":"数据不足","历史错误原因":"扫描预算已停止低优先级历史请求"}
+            key=(datetime.now(MARKET_TIMEZONE).date().isoformat(),str(row["代码"]).zfill(6))
+            with _SCAN_MEMO_LOCK: _SCAN_HISTORY_MEMO[key]=dict(result)
+        else:
+            row,result=completed[future]
+        progress.progress(position/total,text=f"历史强度 {position}/{total}：{row['名称']}（{str(row['代码']).zfill(6)}）")
         output_row = row.copy()
         for field in (
             "20日内是否涨停", "最近涨停日期", "20日涨停次数",
-            "数据状态", "涨停判断", "历史错误原因",
+            "数据状态", "涨停判断", "历史错误原因", "缓存生成时间",
         ):
-            output_row[field] = result[field]
+            output_row[field] = result.get(field)
         processed_rows.append(output_row)
-
-        if position < total:
-            time.sleep(HISTORY_REQUEST_INTERVAL_SECONDS)
 
     progress.empty()
     processed = pd.DataFrame(processed_rows).reset_index(drop=True)
@@ -350,7 +394,7 @@ def apply_limit_up_filter(candidates):
     return processed, final.reset_index(drop=True)
 
 
-def apply_late_session_filter(candidates):
+def apply_late_session_filter(candidates, budget: ScanPerformance | None = None):
     """仅对涨停条件通过的候选股执行免费分钟数据近似分析。"""
     if candidates.empty:
         empty = candidates.copy()
@@ -375,7 +419,10 @@ def apply_late_session_filter(candidates):
             position / total,
             text=f"尾盘结构 {position}/{total}：{stock_name}（{stock_code}）",
         )
-        try:
+        if budget and budget.expired(8):
+            result=unverifiable_late_session_result("扫描预算已停止剩余分钟请求")
+        else:
+          try:
             result = load_late_session_result(stock_code)
             generated = pd.to_datetime(result.get("缓存生成时间"), errors="coerce")
             result["缓存命中状态"] = (
@@ -383,10 +430,10 @@ def apply_late_session_filter(candidates):
                 (pd.Timestamp.now(tz=MARKET_TIMEZONE) - generated).total_seconds() > 2
                 else "新请求"
             )
-        except LateSessionDataError as error:
+          except LateSessionDataError as error:
             logger.warning("股票 %s 尾盘结构无法验证：%s", stock_code, error)
             result = unverifiable_late_session_result(str(error))
-        except Exception as error:
+          except Exception as error:
             logger.exception("股票 %s 尾盘结构发生未知错误", stock_code)
             result = unverifiable_late_session_result(
                 f"未知错误（{type(error).__name__}）"
@@ -397,8 +444,8 @@ def apply_late_session_filter(candidates):
             output_row[key] = value
         processed_rows.append(output_row)
 
-        if position < total:
-            time.sleep(random.uniform(INTRADAY_REQUEST_INTERVAL_SECONDS, 1.5))
+        if position < total and not (budget and budget.expired(8)):
+            time.sleep(0.1)
 
     progress.empty()
     processed = pd.DataFrame(processed_rows).reset_index(drop=True)
@@ -406,7 +453,12 @@ def apply_late_session_filter(candidates):
     return processed, qualified.reset_index(drop=True)
 
 
-def apply_candidate_scoring(candidates, market_data, updated_at):
+def apply_candidate_scoring(
+    candidates, market_data, updated_at,
+    budget: ScanPerformance | None = None,
+    output_limit: int = TARGET_SELECTION_COUNT,
+    reuse_existing: bool = False,
+):
     """对真实候选池评分并执行分层 Top 5 选择。"""
     if candidates.empty:
         empty = candidates.copy()
@@ -425,28 +477,98 @@ def apply_candidate_scoring(candidates, market_data, updated_at):
         industry_strength = pd.DataFrame(columns=["行业", "行业-涨跌幅"])
         industry_source_missing = True
 
+    rows=[row.copy() for _,row in candidates.iterrows()]
+    contexts={}
+    context_cache_hits=0
+    if reuse_existing:
+        for row in rows:
+            code=str(row["代码"]).zfill(6)
+            contexts[code]={"所属行业":row.get("所属行业"),"主力净流入占比":row.get("主力净流入占比"),
+                            "主力资金净流入":row.get("主力资金净流入"),"数据缺失":[]}
+    else:
+        scan_day=datetime.now(MARKET_TIMEZONE).date().isoformat()
+        with _SCAN_MEMO_LOCK:
+            for row in rows:
+                code=str(row["代码"]).zfill(6)
+                memo=_SCAN_CONTEXT_MEMO.get((scan_day,code))
+                if memo is not None:
+                    contexts[code]=dict(memo); context_cache_hits+=1
+        executor=ThreadPoolExecutor(max_workers=SCAN_MAX_WORKERS)
+        context_futures={
+            str(row["代码"]).zfill(6):executor.submit(load_stock_scoring_context,str(row["代码"]).zfill(6))
+            for row in rows if str(row["代码"]).zfill(6) not in contexts
+        }
+        timeout=8 if budget is None else min(8,max(0.1,budget.remaining()-15))
+        done,_=wait(context_futures.values(),timeout=timeout)
+        for code,future in context_futures.items():
+            if future in done:
+                try:
+                    contexts[code]=future.result()
+                    with _SCAN_MEMO_LOCK: _SCAN_CONTEXT_MEMO[(scan_day,code)]=dict(contexts[code])
+                except Exception: logger.exception("股票 %s 评分附加数据失败",code)
+        executor.shutdown(wait=False,cancel_futures=True)
+        for row in rows:
+            code=str(row["代码"]).zfill(6)
+            if code not in contexts:
+                contexts[code]={"所属行业":None,"主力净流入占比":None,"主力资金净流入":None,
+                                "数据缺失":["所属行业","主力资金净流入","扫描预算停止"]}
+                with _SCAN_MEMO_LOCK: _SCAN_CONTEXT_MEMO[(scan_day,code)]=dict(contexts[code])
+
+    industries=sorted({
+        matched
+        for context in contexts.values()
+        for matched,_ in [match_industry_change(context.get("所属行业"),industry_strength)]
+        if matched
+    })
+    board_changes={}
+    if reuse_existing:
+        board_changes={str(row.get("所属行业")):row.get("近5日板块强度") for row in rows if row.get("所属行业")}
+    elif industries and not (budget and budget.expired(15)):
+        scan_day=datetime.now(MARKET_TIMEZONE).date().isoformat()
+        with _SCAN_MEMO_LOCK:
+            for name in industries:
+                key=(scan_day,name)
+                if key in _SCAN_BOARD_MEMO: board_changes[name]=_SCAN_BOARD_MEMO[key]
+        executor=ThreadPoolExecutor(max_workers=SCAN_MAX_WORKERS)
+        board_futures={name:executor.submit(load_industry_five_day_strength,name) for name in industries if name not in board_changes}
+        timeout=3 if budget is None else min(3,max(0.1,budget.remaining()-15))
+        done,_=wait(board_futures.values(),timeout=timeout)
+        for name,future in board_futures.items():
+            if future in done:
+                try:
+                    board_changes[name]=future.result()
+                    with _SCAN_MEMO_LOCK: _SCAN_BOARD_MEMO[(scan_day,name)]=board_changes[name]
+                except Exception: board_changes[name]=None
+        executor.shutdown(wait=False,cancel_futures=True)
+        for name in industries:
+            if name not in board_changes:
+                board_changes[name]=None
+                with _SCAN_MEMO_LOCK: _SCAN_BOARD_MEMO[(scan_day,name)]=None
+
     progress = st.progress(0, text="准备计算候选股综合评分……")
     scored_rows = []
     total = len(candidates)
-    for position, (_, row) in enumerate(candidates.iterrows(), start=1):
+    for position, row in enumerate(rows, start=1):
         code = str(row["代码"]).zfill(6)
         progress.progress(
             position / total,
             text=f"综合评分 {position}/{total}：{row['名称']}（{code}）",
         )
-        try:
-            context = load_stock_scoring_context(code)
-        except Exception:
-            logger.exception("股票 %s 评分附加数据失败", code)
+        context=contexts.get(code)
+        if context is None:
             context = {
                 "所属行业": None,
                 "主力净流入占比": None,
                 "数据缺失": ["所属行业", "主力资金净流入"],
             }
 
-        matched_industry, industry_change = match_industry_change(
-            context.get("所属行业"), industry_strength
-        )
+        if reuse_existing:
+            matched_industry=context.get("所属行业")
+            industry_change=row.get("近5日板块强度")
+        else:
+            matched_industry, industry_change = match_industry_change(
+                context.get("所属行业"), industry_strength
+            )
         missing = [
             item if "数据源缺失" in str(item) else f"{item}（数据源缺失）"
             for item in context.get("数据缺失", [])
@@ -455,11 +577,7 @@ def apply_candidate_scoring(candidates, market_data, updated_at):
             if pd.isna(row.get(field)):
                 missing.append(f"{field}（数据源缺失）")
         if not industry_source_missing and matched_industry:
-            try:
-                industry_change = load_industry_five_day_strength(matched_industry)
-            except ScoringDataError as error:
-                logger.warning("行业 %s 近5日强度不可用：%s", matched_industry, error)
-                industry_change = None
+            industry_change=board_changes.get(matched_industry)
         else:
             industry_change = None
         if industry_change is None:
@@ -480,19 +598,24 @@ def apply_candidate_scoring(candidates, market_data, updated_at):
             output_row[key] = value
         scored_rows.append(output_row)
 
-        if position < total:
-            time.sleep(SCORING_REQUEST_INTERVAL_SECONDS)
-
     progress.empty()
     scored = pd.DataFrame(scored_rows).sort_values(
         ["综合得分", "代码"], ascending=[False, True], kind="mergesort"
     ).reset_index(drop=True)
+    scored.attrs["cache_hit_count"]=context_cache_hits
+    scored.attrs["request_count"]=max(0,len(rows)-context_cache_hits)
     scored["数据更新时间"] = updated_at.strftime("%Y-%m-%d %H:%M:%S")
-    selection = select_layered_top5(scored)
-    selected = selection.selected
-    selected.attrs["funnel"] = selection.funnel
-    selected.attrs["missing_count"] = selection.missing_count
-    selected.attrs["valid_universe_count"] = selection.valid_universe_count
+    if output_limit > TARGET_SELECTION_COUNT:
+        selected=stable_candidate_sort(scored).head(output_limit).reset_index(drop=True)
+        selected.attrs["funnel"]={}
+        selected.attrs["missing_count"]=max(0,output_limit-len(selected))
+        selected.attrs["valid_universe_count"]=len(scored)
+    else:
+        selection = select_layered_top5(scored)
+        selected = selection.selected
+        selected.attrs["funnel"] = selection.funnel
+        selected.attrs["missing_count"] = selection.missing_count
+        selected.attrs["valid_universe_count"] = selection.valid_universe_count
     return scored, selected.reset_index(drop=True)
 
 
@@ -744,6 +867,8 @@ def run_today_scan() -> None:
     final_results = pd.DataFrame()
     data_source_status = "异常"
     interface_errors: list[str] = []
+    performance=ScanPerformance(SCAN_HARD_LIMIT_SECONDS)
+    performance_progress=st.empty()
     st.session_state.scan_in_progress = True
     st.session_state.active_scan_id = scan_id
     st.session_state.dashboard_notice = (
@@ -751,12 +876,20 @@ def run_today_scan() -> None:
     )
     try:
         with st.spinner("正在获取行情并执行现有策略流程，请稍候……"):
-            # 基础快照刷新；分钟线保留90秒有效缓存，避免刷新页面重复轰炸接口。
-            load_market_data.clear()
+            performance_progress.info("正在获取市场快照")
+            token=performance.begin("获取全市场快照")
             market_data, updated_at = load_market_data()
+            performance.end(token,len(market_data),request_count=1,success_count=int(not market_data.empty))
+
+            token=performance.begin("主板/ST过滤",len(market_data))
             filter_result = apply_filters(market_data)
             initial_results = filter_result.initial
+            performance.end(token,len(initial_results))
+
+            performance_progress.info(f"初筛完成：有效主板{len(initial_results)}只，正在向量化基础指标")
+            token=performance.begin("基础指标过滤",len(initial_results))
             enrichment_pool = build_enrichment_pool(filter_result.initial)
+            performance.end(token,len(enrichment_pool))
             source = market_data.attrs.get("data_source", "AKShare")
             data_source_status = f"正常 · {source}"
             supplement_errors = market_data.attrs.get("supplement_errors", [])
@@ -764,17 +897,57 @@ def run_today_scan() -> None:
                 interface_errors.append(
                     f"腾讯行情补齐：{len(supplement_errors)}个批次失败"
                 )
-        history_results, limit_up_results = apply_limit_up_filter(enrichment_pool)
+        performance_progress.info(f"正在分析历史强度：仅处理前{len(enrichment_pool)}只")
+        token=performance.begin("最近20日涨停检查",len(enrichment_pool))
+        history_results, limit_up_results = apply_limit_up_filter(enrichment_pool,performance)
+        history_success=int(history_results.get("数据状态",pd.Series(dtype=str)).eq("正常").sum())
+        history_cache=int(history_results.get("缓存生成时间",pd.Series(dtype=str)).notna().sum()) if "缓存生成时间" in history_results else 0
+        performance.end(token,len(history_results),request_count=len(enrichment_pool),
+                        success_count=history_success,failure_count=len(history_results)-history_success,
+                        cache_hit_count=history_cache)
+
+        token=performance.begin("板块强度",len(history_results))
+        try: load_industry_strength()
+        except Exception: pass
+        performance.end(token,len(history_results),request_count=1)
+
+        performance_progress.info("正在分析板块与资金流向，并筛选前12只")
+        token=performance.begin("资金流向",len(history_results))
         preliminary_scoring, preliminary_top5 = apply_candidate_scoring(
-            history_results, market_data, updated_at
+            history_results, market_data, updated_at,performance,DEEP_ANALYSIS_LIMIT
         )
+        scoring_fail=int(preliminary_scoring.get("缺失项",pd.Series(dtype=str)).astype(str).str.contains("资金",na=False).sum())
+        performance.end(token,len(preliminary_top5),request_count=preliminary_scoring.attrs.get("request_count",len(history_results)),
+                        success_count=max(0,len(history_results)-scoring_fail),failure_count=scoring_fail,
+                        cache_hit_count=preliminary_scoring.attrs.get("cache_hit_count",0))
+
+        performance_progress.info(f"正在分析前{len(preliminary_top5)}只分钟走势")
+        token=performance.begin("分钟行情",len(preliminary_top5))
+        minute_before=get_eastmoney_circuit_status()
         late_session_results, late_qualified = apply_late_session_filter(
-            preliminary_top5
+            preliminary_top5,performance
         )
+        minute_after=get_eastmoney_circuit_status()
+        late_success=int(late_session_results.get("尾盘结构状态",pd.Series(dtype=str)).ne("无法验证").sum())
+        late_cache=int(late_session_results.get("缓存命中状态",pd.Series(dtype=str)).eq("命中").sum())
+        performance.end(token,len(late_session_results),
+                        request_count=max(0,minute_after["request_count"]-minute_before["request_count"]),
+                        success_count=late_success,failure_count=len(late_session_results)-late_success,
+                        cache_hit_count=late_cache,
+                        retry_count=max(0,minute_after["retry_count"]-minute_before["retry_count"]))
+
+        performance_progress.info("正在计算Top5")
+        token=performance.begin("综合评分",len(late_session_results))
         scoring_results, final_results = apply_candidate_scoring(
-            late_session_results, market_data, updated_at
+            late_session_results, market_data, updated_at,performance,TARGET_SELECTION_COUNT,True
         )
+        performance.end(token,len(final_results),cache_hit_count=len(late_session_results))
+
+        performance_progress.info("正在保存推荐记录")
+        token=performance.begin("保存Top5",len(final_results))
         save_official_recommendations(final_results, datetime.now(MARKET_TIMEZONE), data_source_status)
+        performance.end(token,len(final_results),request_count=1,success_count=int(len(final_results)==5))
+        performance_progress.empty()
     except MarketDataError as error:
         logger.exception("AKShare 行情连接失败")
         interface_errors.append(f"实时行情：{error}")
@@ -847,6 +1020,8 @@ def run_today_scan() -> None:
         "current_beijing_time": datetime.now(MARKET_TIMEZONE),
         "deployment_commit_id": get_deployment_commit_id(),
         "base_market_row_count": len(market_data),
+        "scan_performance": performance.records(),
+        "slowest_stage": performance.slowest(),
         "runtime_environment": f"{platform.system()} · Python {platform.python_version()} · {'Streamlit Cloud' if os.getenv('STREAMLIT_SHARING_MODE') else '本地/自托管'}",
         "eastmoney_circuit": get_eastmoney_circuit_status(),
         "excluded_results": excluded_results, "missing_records": missing_records,
@@ -1050,6 +1225,20 @@ def render_scan_results(payload: dict[str, object]) -> None:
             st.dataframe(final_results[available_diagnostics], hide_index=True, width="stretch")
         else:
             st.info("当前没有可展示的逐股分钟诊断记录。")
+    performance_records=payload.get("scan_performance",[])
+    with st.expander("扫描性能诊断",expanded=True):
+        if performance_records:
+            performance_frame=pd.DataFrame(performance_records).rename(columns={
+                "stage":"阶段","started_at":"开始时间","ended_at":"结束时间",
+                "duration_seconds":"耗时（秒）","input_count":"输入股票数",
+                "output_count":"输出股票数","request_count":"请求次数",
+                "success_count":"成功次数","failure_count":"失败次数",
+                "cache_hit_count":"缓存命中次数","retry_count":"重试次数",
+            })
+            st.write(f"最慢阶段：**{payload.get('slowest_stage','--')}**")
+            st.dataframe(performance_frame,hide_index=True,width="stretch")
+        else:
+            st.info("当前扫描记录没有分阶段性能数据。")
     if not late_session_results.empty:
         with st.expander("查看全部尾盘结构分析"):
             render_stock_results(late_session_results)

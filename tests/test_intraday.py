@@ -45,8 +45,8 @@ def test_request_retries_connection_error_with_exponential_backoff(monkeypatch):
     monkeypatch.setattr(intraday.time, "sleep", sleeps.append)
     with pytest.raises(requests.ConnectionError):
         intraday._request_eastmoney({"secid": "0.000001"})
-    assert len(calls) == 4
-    assert sleeps == [1, 2, 4]
+    assert len(calls) == 3
+    assert sleeps == [0.5, 1.0]
 
 
 def test_fallback_to_sina_and_open_circuit_after_two_failures(monkeypatch):

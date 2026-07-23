@@ -2,6 +2,8 @@
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 
 import akshare as ak
 import pandas as pd
@@ -26,19 +28,19 @@ def _market_prefixed_code(code: object) -> str | None:
     return None
 
 
-def fetch_tencent_quote_supplement(codes: pd.Series, batch_size: int = 60) -> pd.DataFrame:
+def fetch_tencent_quote_supplement(codes: pd.Series, batch_size: int = 300) -> pd.DataFrame:
     """从腾讯真实行情批量补齐换手率、量比和总市值。"""
     symbols = [symbol for code in codes if (symbol := _market_prefixed_code(code))]
     records: list[dict[str, object]] = []
     errors: list[str] = []
-    for start in range(0, len(symbols), batch_size):
-        batch = symbols[start : start + batch_size]
+    batches=[symbols[start:start+batch_size] for start in range(0,len(symbols),batch_size)]
+    def fetch_batch(batch):
         try:
             response = call_with_proxy_fallback(
                 lambda batch=batch: requests.get(
                     "https://qt.gtimg.cn/q=" + ",".join(batch),
                     headers={"Referer": "https://gu.qq.com/"},
-                    timeout=15,
+                    timeout=(3, 8),
                 )
             )
             response.raise_for_status()
@@ -48,14 +50,14 @@ def fetch_tencent_quote_supplement(codes: pd.Series, batch_size: int = 60) -> pd
                 response.status_code, len(batch), len(response.content),
             )
         except Exception as error:
-            errors.append(f"{type(error).__name__}: {error}")
-            continue
+            return [],f"{type(error).__name__}: {error}"
+        batch_records=[]
         for match in re.finditer(r'v_\w+="([^"]*)";', text):
             fields = match.group(1).split("~")
             if len(fields) <= 49:
                 continue
             code = str(fields[2]).zfill(6)
-            records.append(
+            batch_records.append(
                 {
                     "代码": code,
                     "换手率": pd.to_numeric(fields[38], errors="coerce"),
@@ -63,11 +65,58 @@ def fetch_tencent_quote_supplement(codes: pd.Series, batch_size: int = 60) -> pd
                     "量比": pd.to_numeric(fields[49], errors="coerce"),
                 }
             )
+        return batch_records,None
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for batch_records,error in executor.map(fetch_batch,batches):
+            records.extend(batch_records)
+            if error: errors.append(error)
     result = pd.DataFrame(records).drop_duplicates("代码") if records else pd.DataFrame(
         columns=["代码", "换手率", "总市值", "量比"]
     )
     result.attrs["errors"] = errors
     return result
+
+
+def fetch_sina_spot_parallel() -> pd.DataFrame:
+    """绕过AKShare串行分页，以5线程读取新浪全市场快照。"""
+    base="https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+    headers={"User-Agent":"Mozilla/5.0","Referer":"https://finance.sina.com.cn/"}
+    try:
+        count_response=requests.get(
+            base+"Market_Center.getHQNodeStockCount",
+            params={"node":"hs_a"},headers=headers,timeout=(3,8),
+        )
+        count_response.raise_for_status()
+        count=int(str(count_response.json()).strip('\"'))
+    except Exception as error:
+        raise MarketDataError(f"新浪股票数量请求失败（{type(error).__name__}）") from error
+    pages=range(1,math.ceil(count/100)+1)
+    def fetch_page(page):
+        response=requests.get(
+            base+"Market_Center.getHQNodeData",
+            params={"page":page,"num":100,"sort":"symbol","asc":1,"node":"hs_a"},
+            headers=headers,timeout=(3,8),
+        )
+        response.raise_for_status()
+        response.encoding="gbk"
+        return response.json()
+    rows=[]
+    errors=[]
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures={executor.submit(fetch_page,page):page for page in pages}
+        for future in as_completed(futures):
+            try: rows.extend(future.result())
+            except Exception as error: errors.append(f"page={futures[future]} {type(error).__name__}: {error}")
+    if not rows:
+        raise MarketDataError("新浪全市场并行快照为空："+("；".join(errors[:3]) or "未知错误"))
+    frame=pd.DataFrame(rows).rename(columns={
+        "code":"代码","name":"名称","trade":"最新价","changepercent":"涨跌幅",
+        "turnoverratio":"换手率","mktcap":"总市值","high":"最高","low":"最低",
+        "volume":"成交量","amount":"成交额",
+    })
+    frame["总市值"]=pd.to_numeric(frame["总市值"],errors="coerce")*10_000
+    frame.attrs["page_errors"]=errors
+    return frame
 
 
 def fetch_a_share_spot() -> pd.DataFrame:
@@ -81,8 +130,8 @@ def fetch_a_share_spot() -> pd.DataFrame:
             type(primary_error).__name__,
         )
         try:
-            data = call_with_proxy_fallback(ak.stock_zh_a_spot)
-            source = "AKShare · 新浪备用源"
+            data = call_with_proxy_fallback(fetch_sina_spot_parallel)
+            source = "新浪并行快照备用源"
         except Exception as fallback_error:
             raise MarketDataError(
                 "AKShare 主用和备用行情源均请求失败"

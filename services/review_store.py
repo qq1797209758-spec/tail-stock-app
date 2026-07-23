@@ -138,15 +138,15 @@ class SQLiteReviewRepository(ReviewRepository):
                        item.get("selection_reason"), item.get("risk_warning")))
             return run_id
 
-    def pending_recommendations(self) -> list[dict[str, Any]]:
+    def pending_recommendations(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute("""
               SELECT r.*, rr.review_status, rr.review_trade_date
               FROM recommendations r JOIN recommendation_runs run ON run.id=r.run_id
               LEFT JOIN review_results rr ON rr.recommendation_id=r.id
               WHERE rr.id IS NULL OR rr.review_status IN ('等待复盘','待补录')
-              ORDER BY run.recommendation_date,r.rank
-            """).fetchall()
+              ORDER BY run.recommendation_date,r.rank LIMIT ?
+            """,(limit,)).fetchall()
             result=[]
             for row in rows:
                 item=dict(row)
@@ -156,6 +156,14 @@ class SQLiteReviewRepository(ReviewRepository):
                 item["component_scores"]=json.loads(item["component_scores"])
                 result.append(item)
             return result
+
+    def pending_count(self) -> int:
+        with self._connect() as db:
+            return int(db.execute("""
+              SELECT COUNT(*) FROM recommendations r
+              LEFT JOIN review_results rr ON rr.recommendation_id=r.id
+              WHERE rr.id IS NULL OR rr.review_status IN ('等待复盘','待补录')
+            """).fetchone()[0])
 
     def upsert_review(self, recommendation_id: int, values: dict[str, Any]) -> None:
         allowed = ["review_trade_date","open_price","high_price","low_price","close_price","volume","amount",

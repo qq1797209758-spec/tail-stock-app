@@ -31,7 +31,7 @@ _SESSION.headers.update({
 _EM_LOCK = Lock()
 _EM_STATE: dict[str, Any] = {
     "failures": 0, "open_until": None, "probe_in_progress": False,
-    "request_count": 0, "last_exception": "", "last_status": None,
+    "request_count": 0, "retry_count": 0, "last_exception": "", "last_status": None,
 }
 _CIRCUIT_FAILURES = 2
 _CIRCUIT_COOLDOWN = timedelta(minutes=5)
@@ -90,14 +90,18 @@ def get_eastmoney_circuit_status() -> dict[str, Any]:
 
 def reset_eastmoney_circuit() -> None:
     with _EM_LOCK:
-        _EM_STATE.update(failures=0, open_until=None, probe_in_progress=False, last_exception="", last_status=None)
+        _EM_STATE.update(failures=0, open_until=None, probe_in_progress=False,
+                         request_count=0, retry_count=0, last_exception="", last_status=None)
 
 
 def _request_eastmoney(params: dict[str, str]) -> Response:
     last_error: BaseException | None = None
-    for attempt in range(4):  # 首次请求 + 最多3次重试，退避1/2/4秒
+    for attempt in range(3):  # 首次请求 + 最多2次重试，退避0.5/1秒
+        if attempt:
+            with _EM_LOCK:
+                _EM_STATE["retry_count"] += 1
         try:
-            response = _SESSION.get(EASTMONEY_URL, params=params, timeout=(5, 15))
+            response = _SESSION.get(EASTMONEY_URL, params=params, timeout=(3, 8))
             retryable = response.status_code == 429 or response.status_code >= 500
             logger.info(
                 "minute_http source=eastmoney url=%s status=%s retry=%s bytes=%s",
@@ -116,8 +120,8 @@ def _request_eastmoney(params: dict[str, str]) -> Response:
             )
             if isinstance(error, requests.HTTPError) and status not in (429,) and (status or 0) < 500:
                 break
-        if attempt < 3:
-            time.sleep(2 ** attempt)
+        if attempt < 2:
+            time.sleep(0.5 * (2 ** attempt))
     assert last_error is not None
     raise last_error
 

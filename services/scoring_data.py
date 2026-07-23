@@ -1,6 +1,7 @@
 """100 分评分所需的免费公开数据。"""
 
 from datetime import datetime, timedelta
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 import akshare as ak
@@ -13,6 +14,7 @@ class ScoringDataError(RuntimeError):
     """评分附加数据请求失败。"""
 
 
+@lru_cache(maxsize=4)
 def fetch_industry_strength() -> pd.DataFrame:
     """获取行业当日涨跌幅。"""
     try:
@@ -32,6 +34,7 @@ def fetch_industry_strength() -> pd.DataFrame:
     return result.dropna().reset_index(drop=True)
 
 
+@lru_cache(maxsize=4096)
 def fetch_stock_scoring_context(stock_code: str) -> dict[str, object]:
     """获取单股所属行业和最新主力净流入占比。"""
     code = str(stock_code).zfill(6)
@@ -90,6 +93,7 @@ def fetch_stock_scoring_context(stock_code: str) -> dict[str, object]:
     return context
 
 
+@lru_cache(maxsize=1024)
 def fetch_industry_five_day_strength(industry_name: str) -> float:
     """用真实行业日线计算最近5个有效交易日收盘变化百分比。"""
     end = datetime.now(ZoneInfo("Asia/Shanghai")).date()
